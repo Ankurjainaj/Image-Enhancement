@@ -1,0 +1,46 @@
+# Core dependencies
+opencv-python-headless
+Pillow
+pillow-avif-plugin  # AVIF image format support
+numpy
+
+# Web framework
+fastapi
+uvicorn[standard]
+httpx
+python-multipart
+
+# Database - MySQL
+sqlalchemy
+pymysql
+cryptography  # For MySQL SSL connections
+
+# Kafka
+confluent-kafka
+
+# Redis
+redis
+
+# Dashboard
+streamlit
+plotly
+pandas
+
+# Pydantic for data validation
+pydantic
+
+# Optional: Better background removal (requires ~500MB)
+# Uncomment for AI-powered background removal
+rembg
+
+# Optional: Quality assessment (requires PyTorch)
+# Uncomment if you want BRISQUE scoring
+pyiqa
+torch
+
+# Optional: AWS integration
+boto3
+botocore
+
+# Development
+python-dotenv

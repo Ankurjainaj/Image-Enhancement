@@ -1,0 +1,116 @@
+version: '3.8'
+
+services:
+  # FastAPI Backend
+  api:
+    build: .
+    container_name: image-enhancer-api
+    ports:
+      - "8000:8000"
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - DATABASE_URL=sqlite:///./data/images.db
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./api:/app/api
+    depends_on:
+      - redis
+      - kafka
+    restart: unless-stopped
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Kafka Worker
+  worker:
+    build: .
+    container_name: image-enhancer-worker
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - DATABASE_URL=sqlite:///./data/images.db
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./workers:/app/workers
+    depends_on:
+      - kafka
+      - redis
+      - api
+    restart: unless-stopped
+    command: python workers/kafka_worker.py
+
+  # Streamlit Dashboard
+  dashboard:
+    build: .
+    container_name: image-enhancer-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - DATABASE_URL=sqlite:///./data/images.db
+      - API_URL=http://api:8000
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./dashboard:/app/dashboard
+    depends_on:
+      - api
+    restart: unless-stopped
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+
+  # Redis for caching and job status
+  redis:
+    image: redis:7-alpine
+    container_name: image-enhancer-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # Kafka (using Redpanda for simplicity - Kafka-compatible)
+  kafka:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.5
+    container_name: image-enhancer-kafka
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://kafka:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://kafka:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr kafka:33145
+      - --advertise-rpc-addr kafka:33145
+      - --smp 1
+      - --memory 512M
+      - --mode dev-container
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"
+      - "18082:18082"
+      - "18081:18081"
+    volumes:
+      - kafka_data:/var/lib/redpanda/data
+    restart: unless-stopped
+
+  # Kafka UI (optional - for debugging)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: image-enhancer-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+    depends_on:
+      - kafka
+    restart: unless-stopped
+    profiles:
+      - debug
+
+volumes:
+  redis_data:
+  kafka_data:

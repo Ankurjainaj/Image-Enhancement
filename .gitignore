@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+enhance-multimodal/
+*.egg-info/
+dist/
+build/
+
+# Logs
+logs/
+*.log
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/demo_output/
+data/uploads/
+data/enhanced/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.avif
+!data/samples/*.jpg
+
+# Database
+*.db
+*.sqlite
+
+# Temporary
+tmp/
+temp/
+*.tmp
+.env
