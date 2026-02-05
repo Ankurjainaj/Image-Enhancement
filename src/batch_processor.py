@@ -47,17 +47,37 @@ async def process_batch_async(job_id: str, image_ids: List[str], mode: str = "au
                         # Mark as processing
                         image_repo.update_status(image_id, ProcessingStatus.PROCESSING)
                         
-                        # Call enhancement API with existing SKU_ID and image_id
-                        response = await client.post(
-                            f"http://localhost:{config.api.port}/api/v1/enhance/url",
-                            json={
-                                "url": image.image_url, 
-                                "mode": mode, 
-                                "output_format": "JPEG",
-                                "sku_id": image.sku_id,
-                                "image_id": image_id
-                            }
-                        )
+                        # Determine endpoint based on USE_GEMINI_BATCH flag
+                        if config.api.use_gemini_batch:
+                            # Use Gemini enhancement endpoint
+                            # Fetch image bytes first
+                            img_response = await client.get(image.image_url)
+                            if img_response.status_code != 200:
+                                failed_count += 1
+                                image_repo.update_status(image_id, ProcessingStatus.FAILED, error_message="Failed to fetch image")
+                                continue
+                            
+                            # Call Gemini enhancement API
+                            files = {"file": ("image.jpg", img_response.content, "image/jpeg")}
+                            data = {"enhancement_prompt": "true color reproduction, neutral white balance, color consistency across product, enhance the quality"}
+                            
+                            response = await client.post(
+                                f"http://localhost:{config.api.port}/api/v1/enhance/gemini",
+                                files=files,
+                                data=data
+                            )
+                        else:
+                            # Use standard enhancement endpoint
+                            response = await client.post(
+                                f"http://localhost:{config.api.port}/api/v1/enhance/url",
+                                json={
+                                    "url": image.image_url, 
+                                    "mode": mode, 
+                                    "output_format": "JPEG",
+                                    "sku_id": image.sku_id,
+                                    "image_id": image_id
+                                }
+                            )
                         
                         if response.status_code == 200:
                             success_count += 1

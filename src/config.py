@@ -270,6 +270,7 @@ class APIConfig:
     # Gemini API configuration
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
     enable_gemini: bool = field(default_factory=lambda: bool(os.getenv("GEMINI_API_KEY")))
+    use_gemini_batch: bool = field(default_factory=lambda: os.getenv("USE_GEMINI_BATCH", "false").lower() == "true")
 
 
 @dataclass
