@@ -8,7 +8,7 @@ import time
 import base64
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 import streamlit as st
 import pandas as pd
@@ -278,15 +278,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def get_image_from_url(url: str, timeout: int = 30) -> Optional[bytes]:
-    """Fetch image from URL"""
+def get_image_from_url(url: str, timeout: int = 30) -> Tuple[Optional[bytes], Optional[str]]:
+    """Fetch image from URL and return (content, content_type)."""
     try:
         response = requests.get(url, timeout=timeout)
         response.raise_for_status()
-        return response.content
+        content_type = response.headers.get('content-type')
+        return response.content, content_type
     except Exception as e:
         logger.error(f"Failed to fetch image from {url}: {e}")
-        return None
+        return None, None
 
 
 def display_comparison(original_bytes: bytes, enhanced_bytes: bytes, metrics: dict):
@@ -704,12 +705,18 @@ def render_single_enhancement():
                         if response.status_code == 200:
                             result_data = response.json()
                             if result_data.get('success'):
-                                enhanced_response = requests.get(result_data['enhanced_url'], timeout=30)
-                                original_response = requests.get(result_data['original_url'], timeout=30)
+                                # Use API proxy endpoints instead of direct S3 URLs
+                                image_id = result_data.get('database_id') or result_data.get('image_id')
+                                enhanced_response = requests.get(f"http://localhost:8000/api/v1/images/{image_id}/enhanced", timeout=30)
+                                original_response = requests.get(f"http://localhost:8000/api/v1/images/{image_id}/original", timeout=30)
                                 enhanced_bytes = enhanced_response.content
                                 original_bytes = original_response.content
-                                original_quality = assessor.quick_assess(original_bytes)
-                                enhanced_quality = assessor.quick_assess(enhanced_bytes)
+                                from PIL import Image
+                                import io
+                                original_img = Image.open(io.BytesIO(original_bytes))
+                                enhanced_img = Image.open(io.BytesIO(enhanced_bytes))
+                                original_quality = assessor.quick_assess(original_img)
+                                enhanced_quality = assessor.quick_assess(enhanced_img)
                                 display_comparison(original_bytes, enhanced_bytes, {'original_blur': original_quality.get('blur_score', 0), 'enhanced_blur': enhanced_quality.get('blur_score', 0)})
                                 st.divider()
                                 col1, col2, col3, col4 = st.columns(4)
@@ -901,14 +908,15 @@ def render_my_tasks():
                 # Original image thumbnail with expander for full view
                 if original_url:
                     try:
-                        img_bytes = get_image_from_url(original_url, timeout=10)
-                        if img_bytes:
+                        img_bytes, ct = get_image_from_url(original_url, timeout=10)
+                        if img_bytes and ct and ct.lower().startswith('image'):
                             img = Image.open(io.BytesIO(img_bytes))
                             img_display = img.copy()
                             img_display.thumbnail((300, 300), Image.Resampling.LANCZOS)
                             st.image(img_display, use_column_width=True)
                         else:
-                            st.warning("❌ Cannot load")
+                            st.warning("❌ Cannot load image (non-image response)")
+                            logger.error(f"Non-image response for {original_url}: content-type={ct}")
                     except Exception as e:
                         st.warning(f"❌ Load error")
                         logger.error(f"Error loading image {original_url}: {e}")
@@ -920,14 +928,15 @@ def render_my_tasks():
                 # Enhanced image thumbnail
                 if enhanced_url:
                     try:
-                        img_bytes = get_image_from_url(enhanced_url, timeout=10)
-                        if img_bytes:
+                        img_bytes, ct = get_image_from_url(enhanced_url, timeout=10)
+                        if img_bytes and ct and ct.lower().startswith('image'):
                             img = Image.open(io.BytesIO(img_bytes))
                             img_display = img.copy()
                             img_display.thumbnail((300, 300), Image.Resampling.LANCZOS)
                             st.image(img_display, use_column_width=True)
                         else:
-                            st.warning("❌ Cannot load")
+                            st.warning("❌ Cannot load enhanced image (non-image response)")
+                            logger.error(f"Non-image response for {enhanced_url}: content-type={ct}")
                     except Exception as e:
                         st.warning(f"❌ Load error")
                         logger.error(f"Error loading image {enhanced_url}: {e}")
@@ -1140,13 +1149,16 @@ def render_approved_tasks():
                         st.caption("**Original**")
                         if original_url:
                             try:
-                                img_bytes = get_image_from_url(original_url, timeout=10)
-                                if img_bytes:
+                                img_bytes, ct = get_image_from_url(original_url, timeout=10)
+                                if img_bytes and ct and ct.lower().startswith('image'):
                                     img = Image.open(io.BytesIO(img_bytes))
                                     st.image(img, use_column_width=True)
                                     st.caption(f"🔗 {original_url}")
                                 else:
-                                    st.warning("❌ Cannot load")
+                                    st.warning("❌ Cannot load (non-image response)")
+                                    logger.error(f"Non-image response for {original_url}: content-type={ct}")
+                                
+                                
                             except Exception as e:
                                 st.warning(f"❌ Load error: {str(e)[:50]}")
                     
@@ -1154,13 +1166,14 @@ def render_approved_tasks():
                         st.caption("**Enhanced**")
                         if enhanced_url:
                             try:
-                                img_bytes = get_image_from_url(enhanced_url, timeout=10)
-                                if img_bytes:
+                                img_bytes, ct = get_image_from_url(enhanced_url, timeout=10)
+                                if img_bytes and ct and ct.lower().startswith('image'):
                                     img = Image.open(io.BytesIO(img_bytes))
                                     st.image(img, use_column_width=True)
                                     st.caption(f"🔗 {enhanced_url}")
                                 else:
-                                    st.warning("❌ Cannot load")
+                                    st.warning("❌ Cannot load enhanced image (non-image response)")
+                                    logger.error(f"Non-image response for {enhanced_url}: content-type={ct}")
                             except Exception as e:
                                 st.warning(f"❌ Load error: {str(e)[:50]}")
             

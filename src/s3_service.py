@@ -158,9 +158,9 @@ class S3Service:
             HTTPS URL
         """
         # If a CloudFront domain is provided, prefer it (strip any scheme)
-        if cloudfront_domain:
-            domain = cloudfront_domain.replace('https://', '').replace('http://', '')
-            return f"https://{domain}/{key}"
+        # if cloudfront_domain:
+        #     domain = cloudfront_domain.replace('https://', '').replace('http://', '')
+        #     return f"https://{domain}/{key}"
 
         # Use boto3 client's endpoint to construct the HTTPS URL in a region-aware way
         try:

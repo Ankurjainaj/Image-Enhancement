@@ -28,6 +28,8 @@ from src.s3_service import S3Service
 import boto3
 from urllib.parse import urlparse
 from botocore.exceptions import ClientError
+import mimetypes
+import os
 
 # Initialize logging
 setup_logging(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -280,6 +282,101 @@ async def fetch_image_from_url(url: str, timeout: float = 30.0) -> bytes:
             )
         
         return content
+
+def _upload_s3_to_cdn(enhanced_image_url: str, original_local_path: str = None) -> Dict[str, Any]:
+    """Download enhanced image from source S3 bucket and re-upload to CDN bucket.
+    
+    Args:
+        enhanced_image_url: Full S3 URL like https://bucket.s3.region.amazonaws.com/path/to/image.jpg
+    
+    Returns:
+        dict with keys: success(bool), message(str), url(optional)
+    """
+    CDN_BUCKET = config.storage.catalyst_bucket
+    SOURCE_BUCKET = config.storage.s3_bucket
+    
+    if not CDN_BUCKET:
+        return {"success": False, "message": "No CDN_BUCKET configured"}
+    if not SOURCE_BUCKET:
+        return {"success": False, "message": "No SOURCE_BUCKET configured"}
+    
+    # Parse S3 key from enhanced_image_url
+    # URL format: https://bucket.s3.region.amazonaws.com/key/path
+    try:
+        from urllib.parse import urlparse
+        parsed_url = urlparse(enhanced_image_url)
+        # Extract key from path (remove leading slash)
+        s3_key = parsed_url.path.lstrip('/')
+        
+        if not s3_key:
+            return {"success": False, "message": "Could not extract S3 key from URL"}
+        
+        logger.info(f"Copying S3 object to CDN: {s3_key}")
+    except Exception as e:
+        return {"success": False, "message": f"Failed to parse S3 URL: {e}"}
+    
+    # Create S3 clients for source and CDN
+    region = config.storage.s3_region or 'ap-south-1'
+    
+    # Source S3 client (for reading enhanced images)
+    try:
+        source_s3_client = boto3.client('s3', region_name=region)
+    except Exception as e:
+        return {"success": False, "message": f"Failed to create source S3 client: {e}"}
+    
+    # CDN S3 client (for writing to catalyst bucket)
+    try:
+        cdn_access = config.storage.catalyst_s3_access_key
+        cdn_secret = config.storage.catalyst_s3_secret_key
+        
+        if cdn_access and cdn_secret and "placeholder" not in cdn_access:
+            logger.info("🔑 Using credentials from Config/Env for CDN upload")
+            cdn_s3_client = boto3.client(
+                's3',
+                aws_access_key_id=cdn_access,
+                aws_secret_access_key=cdn_secret,
+                region_name=region
+            )
+        else:
+            logger.info("🔑 Using Default/CLI credentials for CDN upload")
+            cdn_s3_client = boto3.client('s3', region_name=region)
+    except Exception as e:
+        return {"success": False, "message": f"Failed to create CDN S3 client: {e}"}
+    
+    # Download from source S3
+    try:
+        logger.info(f"Downloading from {SOURCE_BUCKET}/{s3_key}")
+        response = source_s3_client.get_object(Bucket=SOURCE_BUCKET, Key=s3_key)
+        content = response['Body'].read()
+        content_type = response.get('ContentType', 'image/jpeg')
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code')
+        if error_code == 'NoSuchKey':
+            return {"success": False, "message": f"Object not found in source S3: {s3_key}"}
+        return {"success": False, "message": f"Failed to download from S3: {e}"}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to read from source S3: {e}"}
+    
+    # Upload to CDN bucket
+    try:
+        logger.info(f"Uploading to CDN bucket {CDN_BUCKET}{original_local_path}")
+        cdn_s3_client.put_object(
+            Bucket=CDN_BUCKET,
+            Key=original_local_path.lstrip('/'),
+            Body=content,
+            ContentType=content_type,
+            CacheControl='max-age=120'
+        )
+        
+        # Construct CDN URL
+        cdn_url = f"https://{CDN_BUCKET}.s3.{region}.amazonaws.com/{s3_key}"
+        
+        logger.info(f"✅ Successfully uploaded to CDN: {cdn_url}")
+        return {"success": True, "message": "Copied to CDN", "url": cdn_url}
+    except ClientError as e:
+        return {"success": False, "message": f"Failed to upload to CDN: {e}"}
+    except Exception as e:
+        return {"success": False, "message": f"Upload failed: {e}"}
 
 
 def update_job_status(job_id: str, **kwargs):
@@ -576,12 +673,10 @@ async def enhance_url(request: EnhanceUrlRequest):
         # Assess quality after
         quality_after = assessor.quick_assess(enhanced_bytes)
         
-
-        
         db = get_db()
         image_repo = ImageRepository(db)
         
-        # Upload original image to S3
+        # Upload original image to S3 (use CDN domain if configured)
         original_key = f"uploads/original/{image_id}_{filename}"
         original_s3_url = s3_service.upload_image(
             content,
@@ -594,10 +689,18 @@ async def enhance_url(request: EnhanceUrlRequest):
                 "original_url": str(request.url)
             }
         )
-        original_https_url = s3_service.get_https_url(original_key, cloudfront_domain=None)
+        # original_https_url = 
+        domain = config.storage.cloudfront_domain
+        original_https_url = f"https://{domain}/{original_key}"
+        # s3_service.get_https_url(original_key, cloudfront_domain=config.storage.cloudfront_domain)
+        # Store CDN key/path in original_local_path (parsed from HTTPS URL path)
+        # try:
+        original_local_path_val = str(request.url).replace(config.storage.cloudfront_domain, "")
+        # except Exception:
+            # original_local_path_val = f"/{original_key}"
         logger.info(f"[URL-ENHANCE] Original uploaded to S3: {original_key}")
         
-        # Upload enhanced image to S3
+        # Upload enhanced image to S3 (use CDN domain if configured)
         enhanced_key = f"uploads/enhanced/{image_id}_{filename}"
         enhanced_s3_url = s3_service.upload_image(
             enhanced_bytes,
@@ -610,7 +713,7 @@ async def enhance_url(request: EnhanceUrlRequest):
                 "mode": request.mode.value
             }
         )
-        enhanced_https_url = s3_service.get_https_url(enhanced_key, cloudfront_domain=None)
+        enhanced_https_url = s3_service.get_https_url(enhanced_key, cloudfront_domain=config.storage.cloudfront_domain)
         logger.info(f"[URL-ENHANCE] Enhanced uploaded to S3: {enhanced_key}")
         
         # Save or update database record
@@ -626,6 +729,7 @@ async def enhance_url(request: EnhanceUrlRequest):
                 image_repo.update_enhanced(
                     request.image_id,
                     enhanced_url=enhanced_https_url,
+                    original_local_path=original_local_path_val,
                     enhanced_width=result.enhanced_dimensions[0],
                     enhanced_height=result.enhanced_dimensions[1],
                     enhanced_size_bytes=len(enhanced_bytes),
@@ -661,6 +765,7 @@ async def enhance_url(request: EnhanceUrlRequest):
                 image_url=original_https_url,
                 enhanced_image_url=enhanced_https_url,
                 original_filename=filename,
+                original_local_path=original_local_path_val,
                 original_width=result.original_dimensions[0],
                 original_height=result.original_dimensions[1],
                 original_size_bytes=original_size,
@@ -725,6 +830,7 @@ async def enhance_url(request: EnhanceUrlRequest):
         logger.info("=" * 80)
         
         return EnhanceResponse(
+            success=True,
             image_id=product_image.id,
             database_id=product_image.id,
             original_url=original_https_url,
@@ -755,10 +861,9 @@ async def enhance_url(request: EnhanceUrlRequest):
             except:
                 pass
 
-
-@app.get("/api/v1/images/{image_id}/enhanced")
-async def get_enhanced_image(image_id: str):
-    """Download enhanced image"""
+@app.get("/api/v1/images/{image_id}/original")
+async def get_original_image(image_id: str):
+    """Serve original image - proxy if needed"""
     db = get_db()
     try:
         repo = ImageRepository(db)
@@ -767,36 +872,57 @@ async def get_enhanced_image(image_id: str):
         if not image:
             raise HTTPException(404, "Image not found")
         
-        # If we have an S3 URL, redirect to it
+        # If we have an S3 URL, try to fetch and serve it
+        if image.image_url:
+            try:
+                content = await fetch_image_from_url(image.image_url)
+                return StreamingResponse(
+                    io.BytesIO(content),
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"}
+                )
+            except:
+                pass
+        
+        raise HTTPException(404, "Original image not available")
+    finally:
+        db.close()
+
+
+@app.get("/api/v1/images/{image_id}/enhanced")
+async def get_enhanced_image(image_id: str):
+    """Serve enhanced image - proxy if needed"""
+    db = get_db()
+    try:
+        repo = ImageRepository(db)
+        image = repo.get_by_id(image_id)
+        
+        if not image:
+            raise HTTPException(404, "Image not found")
+        
+        # If we have an S3 URL, try to fetch and serve it
         if image.enhanced_image_url:
-            from fastapi.responses import RedirectResponse
-            return RedirectResponse(url=image.enhanced_image_url)
+            try:
+                content = await fetch_image_from_url(image.enhanced_image_url)
+                return StreamingResponse(
+                    io.BytesIO(content),
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"}
+                )
+            except:
+                pass
         
         # Fallback to local path
-        if not image.enhanced_local_path:
-            raise HTTPException(404, "Enhanced image not available")
+        if image.enhanced_local_path:
+            path = Path(image.enhanced_local_path)
+            if path.exists():
+                return StreamingResponse(
+                    open(path, 'rb'),
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"}
+                )
         
-        path = Path(image.enhanced_local_path)
-        if not path.exists():
-            raise HTTPException(404, "Enhanced image file not found")
-        
-        # Determine content type
-        ext = path.suffix.lower()
-        content_types = {
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.png': 'image/png',
-            '.webp': 'image/webp'
-        }
-        content_type = content_types.get(ext, 'image/jpeg')
-        
-        return StreamingResponse(
-            open(path, 'rb'),
-            media_type=content_type,
-            headers={
-                "Content-Disposition": f"attachment; filename={image_id}{ext}"
-            }
-        )
+        raise HTTPException(404, "Enhanced image not available")
     finally:
         db.close()
 
@@ -1316,6 +1442,26 @@ async def approve_task(
         db.commit()
         
         logger.info(f"Task {task_id} approved for SKU {image.sku_id}")
+        
+        # On approval, copy enhanced image from source S3 to CDN
+        try:
+            if getattr(image, 'enhanced_image_url', None) and getattr(image, 'original_local_path', None):
+                enhanced_url = image.enhanced_image_url
+                original_local_path = image.original_local_path
+                upload_res = _upload_s3_to_cdn(enhanced_url, original_local_path)
+                if upload_res.get('success'):
+                    # Update enhanced_image_url to CDN URL so marketplace can use it
+                    try:
+                        image.enhanced_image_url = upload_res.get('url')
+                        db.commit()
+                        logger.info(f"Updated enhanced_image_url to CDN: {upload_res.get('url')}")
+                    except Exception as e:
+                        db.rollback()
+                        logger.error(f"Failed to update DB with CDN URL: {e}")
+                else:
+                    logger.warning(f"CDN upload failed for {enhanced_url}: {upload_res.get('message')}")
+        except Exception as e:
+            logger.error(f"Error while uploading approved image to CDN: {e}", exc_info=True)
         
         return {
             "success": True,
