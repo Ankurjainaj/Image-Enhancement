@@ -668,6 +668,10 @@ async def enhance_url(request: EnhanceUrlRequest):
         logger.info(f"[URL-ENHANCE] Enhancement history created: {history.id}")
         
         processing_time = int((time.time() - start_time) * 1000)
+        # Calculate quality improvement
+        blur_before = quality_before.get('blur_score', 0)
+        blur_after = quality_after.get('blur_score', 0)
+        improvement = ((blur_after - blur_before) / max(blur_before, 1)) * 100 if blur_before else None
         
         logger.info("=" * 80)
         logger.info(f"✅ ENHANCEMENT COMPLETE | ID: {image_id}")
