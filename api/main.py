@@ -759,7 +759,8 @@ async def enhance_url(request: EnhanceUrlRequest):
             else:
                 raise HTTPException(404, f"Image ID {request.image_id} not found")
         else:
-            # Create new record
+            # Create new record with qc_status='pending' for QC review
+            from src.config import QCStatus
             product_image = image_repo.create(
                 sku_id=request.sku_id if request.sku_id else f"url_{image_id}",
                 image_url=original_https_url,
@@ -775,6 +776,7 @@ async def enhance_url(request: EnhanceUrlRequest):
                 original_format=mime_type.split('/')[-1].upper(),
                 enhanced_format=request.output_format,
                 status=ProcessingStatus.COMPLETED.value,
+                qc_status=QCStatus.PENDING.value,
                 processing_time_ms=result.processing_time_ms,
                 enhancement_mode=request.mode.value,
                 processed_at=datetime.utcnow(),
@@ -1699,6 +1701,83 @@ async def get_batch_job_status(job_id: str):
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             "error_message": job.error_message
         }
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/tasks/{task_id}/remove-background")
+async def remove_background_preview(task_id: str):
+    """Remove background from enhanced image and return preview URL (not persisted)"""
+    db = get_db()
+    try:
+        image = db.query(ImageRecord).filter(ImageRecord.id == task_id).first()
+        if not image:
+            raise HTTPException(404, "Task not found")
+        
+        if not image.enhanced_image_url:
+            raise HTTPException(400, "No enhanced image available")
+        
+        # Fetch enhanced image
+        enhanced_bytes = await fetch_image_from_url(image.enhanced_image_url)
+        
+        # Remove background using rembg
+        from rembg import remove
+        bg_removed_bytes = remove(enhanced_bytes)
+        
+        # Upload to S3 with temp prefix
+        temp_key = f"uploads/temp/bg_removed_{task_id}_{uuid.uuid4()}.png"
+        temp_s3_url = s3_service.upload_image(
+            bg_removed_bytes,
+            temp_key,
+            "image/png",
+            metadata={"type": "temp_bg_removed", "task_id": task_id}
+        )
+        temp_https_url = s3_service.get_https_url(temp_key, cloudfront_domain=None)
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "preview_url": temp_https_url,
+            "temp_key": temp_key,
+            "message": "Background removed. Preview ready."
+        }
+    except Exception as e:
+        logger.error(f"Background removal failed: {e}", exc_info=True)
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/tasks/{task_id}/apply-background-removal")
+async def apply_background_removal(task_id: str, preview_url: str = Form(...)):
+    """Apply background removal by updating enhanced_image_url with preview URL"""
+    db = get_db()
+    try:
+        image = db.query(ImageRecord).filter(ImageRecord.id == task_id).first()
+        if not image:
+            raise HTTPException(404, "Task not found")
+        
+        # Store original enhanced URL as backup
+        original_enhanced_url = image.enhanced_image_url
+        
+        # Update enhanced_image_url with new background-removed image
+        image.enhanced_image_url = preview_url
+        image.background_removed = True
+        db.commit()
+        
+        logger.info(f"Applied background removal for task {task_id}")
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "new_enhanced_url": preview_url,
+            "original_enhanced_url": original_enhanced_url,
+            "message": "Background removal applied successfully"
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to apply background removal: {e}", exc_info=True)
+        raise HTTPException(500, str(e))
     finally:
         db.close()
 

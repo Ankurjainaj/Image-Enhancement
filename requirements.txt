@@ -23,6 +23,7 @@ redis
 
 # Dashboard
 streamlit
+streamlit-cropper
 plotly
 pandas
 
