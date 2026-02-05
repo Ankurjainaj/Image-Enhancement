@@ -6,7 +6,6 @@ import io
 import sys
 import time
 import base64
-import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -43,8 +42,8 @@ logger = logging.getLogger(__name__)
 
 # Page config
 st.set_page_config(
-    page_title="Image Enhancement Pipeline - MedikaBazaar",
-    page_icon="🏥",
+    page_title="Image Enhancement Pipeline",
+    page_icon="🖼️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -69,10 +68,6 @@ s3_service = S3Service(
     secret_key=config.storage.s3_secret_key
 )
 
-# Initialize session state for navigation
-if "current_page" not in st.session_state:
-    st.session_state.current_page = "📊 Dashboard"
-
 # Initialize session state for task approvals
 if "show_reject_reasons" not in st.session_state:
     st.session_state.show_reject_reasons = {}
@@ -84,81 +79,93 @@ if "refresh_tasks" not in st.session_state:
     st.session_state.refresh_tasks = False
 
 
-# Custom CSS for MedikaBazaar E-commerce Theme
+# Custom CSS for Professional Demo Look
 st.markdown("""
 <style>
     /* Import Google Font */
-    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     
     /* Global styling */
     html, body, [class*="css"] {
-        font-family: 'Poppins', sans-serif;
-        background: #f8f9fa;
+        font-family: 'Inter', sans-serif;
     }
     
-    /* Top Header Bar - MedikaBazaar Style */
-    .top-header {
-        background: linear-gradient(135deg, #00a8cc 0%, #0077b6 100%);
-        padding: 1.2rem 2rem;
-        margin: -1rem -1rem 2rem -1rem;
-        box-shadow: 0 4px 12px rgba(0, 119, 182, 0.2);
+    /* Main header gradient */
+    .main-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 2rem 2.5rem;
+        border-radius: 16px;
+        margin-bottom: 2rem;
+        box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
     }
     
-    .top-header h1 {
+    .main-header h1 {
         color: white;
-        font-size: 1.8rem;
-        font-weight: 600;
+        font-size: 2.5rem;
+        font-weight: 700;
         margin: 0;
         display: flex;
         align-items: center;
         gap: 12px;
     }
     
-    .top-header p {
-        color: rgba(255, 255, 255, 0.95);
-        font-size: 0.9rem;
-        margin: 0.3rem 0 0 0;
-        font-weight: 400;
+    .main-header p {
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 1.1rem;
+        margin: 0.5rem 0 0 0;
     }
     
-    /* Metric Cards - Clean E-commerce Style */
+    /* Metric Cards with gradient backgrounds */
     .metric-card {
-        background: white;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 1.5rem;
         border-radius: 12px;
-        border: 1px solid #e0e0e0;
+        color: white;
         text-align: center;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.25);
         transition: transform 0.2s ease;
     }
     
     .metric-card:hover {
-        transform: translateY(-3px);
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+        transform: translateY(-2px);
+    }
+    
+    .success-metric {
+        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        box-shadow: 0 4px 15px rgba(17, 153, 142, 0.25);
+    }
+    
+    .warning-metric {
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        box-shadow: 0 4px 15px rgba(240, 147, 251, 0.25);
+    }
+    
+    .info-metric {
+        background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        box-shadow: 0 4px 15px rgba(79, 172, 254, 0.25);
     }
     
     /* Streamlit metric overrides */
     [data-testid="stMetricValue"] {
         font-size: 2rem;
         font-weight: 700;
-        color: #0077b6;
     }
     
     [data-testid="stMetricDelta"] {
         font-size: 0.9rem;
     }
     
+    /* Remove default styling that conflicts with dark mode */
     div[data-testid="stMetric"] {
-        background: white;
-        padding: 1.2rem;
+        background: transparent !important;
+        padding: 1rem;
         border-radius: 12px;
-        border: 1px solid #e0e0e0;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+        border: 1px solid rgba(128, 128, 128, 0.3);
+        box-shadow: none;
     }
     
     [data-testid="stMetricLabel"] {
-        color: #6c757d !important;
-        font-weight: 500;
+        color: inherit !important;
     }
     
     /* Comparison container */
@@ -186,103 +193,58 @@ st.markdown("""
         gap: 8px;
     }
     
-    /* Sidebar styling - Navigation Menu */
+    /* Sidebar styling */
     section[data-testid="stSidebar"] {
-        background: #ffffff;
-        border-right: 1px solid #e0e0e0;
+        background: transparent;
     }
     
     section[data-testid="stSidebar"] > div {
-        padding-top: 0;
-        background: #ffffff;
+        padding-top: 2rem;
     }
     
-    /* Sidebar navigation items - Box Style */
-    .nav-item {
-        padding: 0.8rem 1.2rem;
-        margin: 0.3rem 0;
-        border-radius: 8px;
-        cursor: pointer;
-        transition: all 0.2s ease;
-        font-weight: 500;
-        color: #495057;
-        background: #f8f9fa;
-        border: 1px solid #e0e0e0;
-        display: block;
-        text-decoration: none;
-    }
-    
-    .nav-item:hover {
-        background: #e3f2fd;
-        color: #0077b6;
-        border-color: #0077b6;
-        transform: translateX(5px);
-    }
-    
-    .nav-item.active {
-        background: linear-gradient(135deg, #00a8cc 0%, #0077b6 100%);
-        color: white;
-        border-color: #0077b6;
-        box-shadow: 0 2px 8px rgba(0, 119, 182, 0.3);
-    }
-    
-    /* Hide radio buttons */
-    .stRadio > div {
-        gap: 0.5rem;
-    }
-    
-    .stRadio > div > label {
-        background: #f8f9fa;
-        padding: 0.9rem 1.2rem;
-        border-radius: 8px;
-        border: 1px solid #e0e0e0;
-        cursor: pointer;
-        transition: all 0.2s ease;
-        font-weight: 500;
-        width: 100%;
-        margin: 0.3rem 0;
-    }
-    
-    .stRadio > div > label:hover {
-        background: #e3f2fd;
-        border-color: #0077b6;
-        transform: translateX(5px);
-    }
-    
-    .stRadio > div > label[data-baseweb="radio"] > div:first-child {
-        display: none;
-    }
-    
-    /* Button styling - MedikaBazaar Theme */
+    /* Button styling */
     .stButton > button {
-        background: linear-gradient(135deg, #00a8cc 0%, #0077b6 100%);
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
         border: none;
         padding: 0.75rem 1.5rem;
         font-weight: 600;
         border-radius: 8px;
         transition: all 0.2s ease;
-        box-shadow: 0 3px 10px rgba(0, 119, 182, 0.25);
+        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
     }
     
     .stButton > button:hover {
         transform: translateY(-2px);
-        box-shadow: 0 5px 15px rgba(0, 119, 182, 0.35);
-        background: linear-gradient(135deg, #0077b6 0%, #005f8a 100%);
+        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
     }
     
     /* Download button */
     .stDownloadButton > button {
-        background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
         color: white;
         border: none;
         font-weight: 600;
-        box-shadow: 0 3px 10px rgba(40, 167, 69, 0.25);
+        box-shadow: 0 4px 15px rgba(17, 153, 142, 0.3);
     }
     
-    /* Hide default tabs - using sidebar navigation */
-    .stTabs {
-        display: block;
+    /* Tab styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        background-color: transparent;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        background: rgba(128, 128, 128, 0.2);
+        border-radius: 8px;
+        padding: 0.5rem 1rem;
+        font-weight: 500;
+        color: inherit;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white !important;
     }
     
     /* Footer */
@@ -312,17 +274,6 @@ st.markdown("""
     /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    
-    /* Spinning loader */
-    @keyframes spin {
-        0% { transform: rotate(0deg); }
-        100% { transform: rotate(360deg); }
-    }
-    
-    .loader {
-        display: inline-block;
-        animation: spin 1s linear infinite;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -338,43 +289,19 @@ def get_image_from_url(url: str, timeout: int = 30) -> Optional[bytes]:
         return None
 
 
-def display_image_with_loader(url: str, key: str, caption: str = None):
-    """Display image with spinning loader while loading"""
-    placeholder = st.empty()
-    placeholder.markdown(
-        '<div style="text-align: center;"><img src="https://play-lh.googleusercontent.com/DJp5dMm6hA0Ejig1J9sFj6oAEOj9YN7ahpFP2FzGFUSp5xYy4Yt0s4Ag9h792Z7kBdY" class="loader" style="width: 30px; height: 30px;"></div>',
-        unsafe_allow_html=True
-    )
-    try:
-        img_bytes = get_image_from_url(url, timeout=10)
-        if img_bytes:
-            placeholder.empty()
-            if caption:
-                st.caption(caption)
-            st.image(img_bytes)
-            return True
-        else:
-            placeholder.warning("❌ Cannot load")
-            return False
-    except Exception as e:
-        placeholder.warning("❌ Load error")
-        logger.error(f"Error loading image {url}: {e}")
-        return False
-
-
 def display_comparison(original_bytes: bytes, enhanced_bytes: bytes, metrics: dict):
     """Display before/after comparison"""
     col1, col2 = st.columns(2)
     
     with col1:
         st.subheader("📷 Original")
-        st.image(original_bytes)
+        st.image(original_bytes, use_column_width=True)
         st.caption(f"Size: {len(original_bytes)/1024:.1f} KB | "
                   f"Blur Score: {metrics.get('original_blur', 'N/A'):.1f}")
     
     with col2:
         st.subheader("✨ Enhanced")
-        st.image(enhanced_bytes)
+        st.image(enhanced_bytes, use_column_width=True)
         st.caption(f"Size: {len(enhanced_bytes)/1024:.1f} KB | "
                   f"Blur Score: {metrics.get('enhanced_blur', 'N/A'):.1f}")
 
@@ -806,8 +733,8 @@ def render_single_enhancement():
 
 
 def render_my_tasks():
-    """Render Open Tasks tab with approval workflow"""
-    st.subheader("📋 Open Tasks - Approval Queue")
+    """Render My Tasks tab with approval workflow"""
+    st.subheader("✅ My Tasks - Approval Queue")
     
     st.markdown("""
     Review and approve enhanced images before publishing. 
@@ -844,11 +771,9 @@ def render_my_tasks():
                     enh = task.get("enhanced_quality_score")
                     if orig is not None and enh is not None:
                         try:
-                            orig_val = float(orig) if not isinstance(orig, (int, float)) else orig
-                            enh_val = float(enh) if not isinstance(enh, (int, float)) else enh
-                            avg_improvement += (enh_val - orig_val)
+                            avg_improvement += (float(enh) - float(orig))
                             count += 1
-                        except (ValueError, TypeError):
+                        except:
                             pass
                 avg_improvement = avg_improvement / count if count > 0 else 0
                 st.metric("📈 Avg Quality Improvement", f"+{avg_improvement:.1f}%")
@@ -886,14 +811,10 @@ def render_my_tasks():
         if sort_by == "SKU ID":
             filtered_tasks.sort(key=lambda x: x.get("sku_id", ""))
         elif sort_by == "Quality Improvement":
-            def get_improvement(x):
-                try:
-                    enh = x.get("enhanced_quality_score", 0) or 0
-                    orig = x.get("original_quality_score", 0) or 0
-                    return float(enh) - float(orig)
-                except (ValueError, TypeError):
-                    return 0
-            filtered_tasks.sort(key=get_improvement, reverse=True)
+            filtered_tasks.sort(
+                key=lambda x: float(x.get("enhanced_quality_score", 0) or 0) - float(x.get("original_quality_score", 0) or 0),
+                reverse=True
+            )
         elif sort_by == "File Size":
             filtered_tasks.sort(key=lambda x: x.get("enhanced_size_bytes", 0), reverse=True)
         # Latest is default (already sorted by created_at in API)
@@ -904,22 +825,22 @@ def render_my_tasks():
         total_pages = (len(filtered_tasks) + items_per_page - 1) // items_per_page
         col_prev, col_page, col_next = st.columns([1, 4, 1])
         
-        if "tasks_pagination_page" not in st.session_state:
-            st.session_state.tasks_pagination_page = 1
+        if "current_page" not in st.session_state:
+            st.session_state.current_page = 1
         
         with col_prev:
             if st.button("⬅️ Previous"):
-                st.session_state.tasks_pagination_page = max(1, st.session_state.tasks_pagination_page - 1)
+                st.session_state.current_page = max(1, st.session_state.current_page - 1)
         
         with col_page:
-            st.markdown(f"**Page {st.session_state.tasks_pagination_page} of {total_pages}**", unsafe_allow_html=True)
+            st.markdown(f"**Page {st.session_state.current_page} of {total_pages}**", unsafe_allow_html=True)
         
         with col_next:
             if st.button("Next ➡️"):
-                st.session_state.tasks_pagination_page = min(total_pages, st.session_state.tasks_pagination_page + 1)
+                st.session_state.current_page = min(total_pages, st.session_state.current_page + 1)
         
         # Get paginated tasks
-        start_idx = (st.session_state.tasks_pagination_page - 1) * items_per_page
+        start_idx = (st.session_state.current_page - 1) * items_per_page
         end_idx = start_idx + items_per_page
         paginated_tasks = filtered_tasks[start_idx:end_idx]
         
@@ -960,12 +881,6 @@ def render_my_tasks():
             # Size metrics
             orig_size_bytes = task.get("original_size_bytes", 0)
             enh_size_bytes = task.get("enhanced_size_bytes", 0)
-            try:
-                orig_size_bytes = float(orig_size_bytes) if orig_size_bytes else 0
-                enh_size_bytes = float(enh_size_bytes) if enh_size_bytes else 0
-            except (ValueError, TypeError):
-                orig_size_bytes = 0
-                enh_size_bytes = 0
             orig_size_kb = orig_size_bytes / 1024 if orig_size_bytes else 0
             enh_size_kb = enh_size_bytes / 1024 if enh_size_bytes else 0
             
@@ -985,7 +900,18 @@ def render_my_tasks():
             with col2:
                 # Original image thumbnail with expander for full view
                 if original_url:
-                    display_image_with_loader(original_url, f"orig_{task_id}")
+                    try:
+                        img_bytes = get_image_from_url(original_url, timeout=10)
+                        if img_bytes:
+                            img = Image.open(io.BytesIO(img_bytes))
+                            img_display = img.copy()
+                            img_display.thumbnail((300, 300), Image.Resampling.LANCZOS)
+                            st.image(img_display, use_container_width=True)
+                        else:
+                            st.warning("❌ Cannot load")
+                    except Exception as e:
+                        st.warning(f"❌ Load error")
+                        logger.error(f"Error loading image {original_url}: {e}")
                 
                 st.caption(f"📦 {orig_size_kb:.1f}KB")
                 st.caption(f"📐 {orig_w}×{orig_h}px" if orig_w and orig_h else "📐 N/A")
@@ -993,7 +919,18 @@ def render_my_tasks():
             with col3:
                 # Enhanced image thumbnail
                 if enhanced_url:
-                    display_image_with_loader(enhanced_url, f"enh_{task_id}")
+                    try:
+                        img_bytes = get_image_from_url(enhanced_url, timeout=10)
+                        if img_bytes:
+                            img = Image.open(io.BytesIO(img_bytes))
+                            img_display = img.copy()
+                            img_display.thumbnail((300, 300), Image.Resampling.LANCZOS)
+                            st.image(img_display, use_container_width=True)
+                        else:
+                            st.warning("❌ Cannot load")
+                    except Exception as e:
+                        st.warning(f"❌ Load error")
+                        logger.error(f"Error loading image {enhanced_url}: {e}")
                 
                 st.caption(f"📦 {enh_size_kb:.1f}KB")
                 st.caption(f"📐 {enh_w}×{enh_h}px" if enh_w and enh_h else "📐 N/A")
@@ -1059,22 +996,6 @@ def render_my_tasks():
                 with col_reject:
                     if st.button("❌", key=f"reject_btn_{task_id}", help="Reject this task"):
                         st.session_state[f"show_reject_{task_id}"] = True
-                
-                # Background removal button
-                if st.button("🖼️ Remove BG", key=f"bg_remove_{task_id}", help="Remove background"):
-                    with st.spinner("Removing background..."):
-                        try:
-                            api_url = f"http://localhost:{config.api.port}"
-                            bg_response = requests.post(f"{api_url}/api/v1/tasks/{task_id}/remove-background")
-                            if bg_response.status_code == 200:
-                                result = bg_response.json()
-                                st.session_state[f"bg_preview_{task_id}"] = result["preview_url"]
-                                st.session_state[f"show_bg_preview_{task_id}"] = True
-                                st.rerun()
-                            else:
-                                st.error(f"Error: {bg_response.text}")
-                        except Exception as e:
-                            st.error(f"Error: {str(e)}")
             
             with col7:
                 status_badge = task.get("qc_status", "PENDING")
@@ -1119,116 +1040,16 @@ def render_my_tasks():
                     if st.button("✕ Cancel", key=f"cancel_reject_{task_id}"):
                         st.session_state[f"show_reject_{task_id}"] = False
             
-            # Background removal preview
-            if st.session_state.get(f"show_bg_preview_{task_id}"):
-                st.info("🖼️ Background Removal Preview & Editing")
-                preview_url = st.session_state.get(f"bg_preview_{task_id}")
-                
-                col_preview1, col_preview2 = st.columns(2)
-                with col_preview1:
-                    st.caption("**Current Enhanced**")
-                    if enhanced_url:
-                        display_image_with_loader(enhanced_url, f"prev_curr_{task_id}")
-                
-                with col_preview2:
-                    st.caption("**With Background Removed**")
-                    if preview_url:
-                        placeholder = st.empty()
-                        placeholder.markdown(
-                            '<div style="text-align: center;"><img src="https://play-lh.googleusercontent.com/DJp5dMm6hA0Ejig1J9sFj6oAEOj9YN7ahpFP2FzGFUSp5xYy4Yt0s4Ag9h792Z7kBdY" class="loader" style="width: 30px; height: 30px;"></div>',
-                            unsafe_allow_html=True
-                        )
-                        try:
-                            img_bytes = get_image_from_url(preview_url, timeout=10)
-                            if img_bytes:
-                                placeholder.empty()
-                                # Store image bytes in session state for cropping
-                                st.session_state[f"bg_img_bytes_{task_id}"] = img_bytes
-                                st.image(img_bytes, use_container_width=True)
-                        except:
-                            placeholder.warning("❌ Load error")
-                
-                # Crop tool
-                if st.checkbox("✂️ Enable Crop Tool", key=f"enable_crop_{task_id}"):
-                    try:
-                        from streamlit_cropper import st_cropper
-                        img_bytes = st.session_state.get(f"bg_img_bytes_{task_id}")
-                        if img_bytes:
-                            img = Image.open(io.BytesIO(img_bytes))
-                            st.caption("**Drag to crop the image:**")
-                            cropped_img = st_cropper(
-                                img, 
-                                realtime_update=True, 
-                                box_color='#0077b6',
-                                aspect_ratio=None,
-                                return_type='image'
-                            )
-                            
-                            if cropped_img:
-                                # Save cropped image to session state
-                                buf = io.BytesIO()
-                                cropped_img.save(buf, format='PNG')
-                                st.session_state[f"cropped_img_{task_id}"] = buf.getvalue()
-                                st.success("✅ Image cropped! Click 'Apply' to save.")
-                    except ImportError:
-                        st.warning("⚠️ streamlit-cropper not installed. Using fallback crop tool.")
-                        st.info("Install with: pip install streamlit-cropper")
-                
-                col_apply, col_revert, col_space2 = st.columns([1, 1, 2])
-                with col_apply:
-                    if st.button("✓ Apply", key=f"apply_bg_{task_id}"):
-                        with st.spinner("Applying..."):
-                            try:
-                                # Use cropped image if available, otherwise use preview
-                                final_img_bytes = st.session_state.get(f"cropped_img_{task_id}")
-                                final_url = preview_url
-                                
-                                if final_img_bytes:
-                                    # Upload cropped image to S3
-                                    temp_key = f"uploads/temp/cropped_{task_id}_{uuid.uuid4()}.png"
-                                    cropped_s3_url = s3_service.upload_image(
-                                        final_img_bytes,
-                                        temp_key,
-                                        "image/png",
-                                        metadata={"type": "cropped", "task_id": task_id}
-                                    )
-                                    final_url = s3_service.get_https_url(temp_key, cloudfront_domain=None)
-                                
-                                api_url = f"http://localhost:{config.api.port}"
-                                apply_response = requests.post(
-                                    f"{api_url}/api/v1/tasks/{task_id}/apply-background-removal",
-                                    data={"preview_url": final_url}
-                                )
-                                if apply_response.status_code == 200:
-                                    st.toast("✅ Changes applied!", icon="✅")
-                                    st.session_state[f"show_bg_preview_{task_id}"] = False
-                                    st.session_state.pop(f"cropped_img_{task_id}", None)
-                                    st.session_state.refresh_tasks = not st.session_state.refresh_tasks
-                                    time.sleep(1)
-                                    st.rerun()
-                                else:
-                                    st.error(f"Error: {apply_response.text}")
-                            except Exception as e:
-                                st.error(f"Error: {str(e)}")
-                
-                with col_revert:
-                    if st.button("✕ Cancel", key=f"revert_bg_{task_id}"):
-                        st.session_state[f"show_bg_preview_{task_id}"] = False
-                        st.session_state.pop(f"cropped_img_{task_id}", None)
-                        st.rerun()
-            
             st.divider()
         
     except Exception as e:
         st.error(f"Error loading tasks: {str(e)}")
-        import traceback
-        st.error(f"Traceback: {traceback.format_exc()}")
         logger.error(f"Error in render_my_tasks: {e}", exc_info=True)
 
 
 def render_approved_tasks():
-    """Render Completed Tasks tab"""
-    st.subheader("✅ Completed Tasks")
+    """Render approved tasks tab"""
+    st.subheader("✅ Approved Images")
     st.markdown("View all approved and published images.")
     
     try:
@@ -1244,19 +1065,10 @@ def render_approved_tasks():
             st.metric("✅ Total Approved", total_tasks)
         with col2:
             if tasks:
-                total_reduction = 0
-                count = 0
-                for t in tasks:
-                    if t.get("original_size_bytes"):
-                        try:
-                            orig = float(t.get("original_size_bytes", 1))
-                            enh = float(t.get("enhanced_size_bytes", 0))
-                            if orig > 0:
-                                total_reduction += (1 - enh / orig) * 100
-                                count += 1
-                        except (ValueError, TypeError):
-                            pass
-                avg_size_reduction = total_reduction / count if count > 0 else 0
+                avg_size_reduction = sum(
+                    (1 - t.get("enhanced_size_bytes", 0) / max(t.get("original_size_bytes", 1), 1)) * 100
+                    for t in tasks if t.get("original_size_bytes")
+                ) / len(tasks)
                 st.metric("💾 Avg Size Reduction", f"{avg_size_reduction:.1f}%")
         with col3:
             if tasks:
@@ -1362,22 +1174,36 @@ def render_approved_tasks():
 def render_batch_process():
     """Render batch processing tab"""
     st.subheader("📦 Batch Process")
-    st.markdown("Process multiple pending images in batch mode")
-    
-    # Show current processing mode
-    use_gemini = getattr(config.api, 'use_gemini_batch', False)
-    if use_gemini:
-        st.info("🤖 **Mode: Gemini AI Enhancement** (Set via USE_GEMINI_BATCH environment variable)")
-    else:
-        st.info("🔧 **Mode: Standard Enhancement Pipeline** (Set USE_GEMINI_BATCH=true to use Gemini)")
+    st.markdown("Process multiple images in batch mode")
     
     # Input section
-    st.markdown("### Configuration")
+    st.markdown("### Input")
     
-    st.caption("🤖 AUTO mode will automatically select pending images from the database")
-    limit = st.number_input("Max images to process", min_value=1, max_value=1000, value=100)
-    batch_size = st.number_input("Batch size (images per batch)", min_value=1, max_value=50, value=10)
-    st.caption("Smaller batch sizes reduce server load")
+    input_type = st.radio("Select input type:", ["AUTO", "SKU IDs", "Image URLs"], horizontal=True)
+    
+    if input_type == "AUTO":
+        st.info("🤖 AUTO mode will automatically select pending images from the database")
+        limit = st.number_input("Max images to process", min_value=1, max_value=1000, value=100)
+        batch_size = st.number_input("Batch size (images per batch)", min_value=1, max_value=50, value=10)
+        st.caption("Smaller batch sizes reduce server load")
+    elif input_type == "SKU IDs":
+        sku_input = st.text_area(
+            "Enter SKU IDs (one per line)",
+            height=150,
+            placeholder="SKU-001\nSKU-002\nSKU-003"
+        )
+        sku_ids = [s.strip() for s in sku_input.split('\n') if s.strip()]
+        st.info(f"📊 {len(sku_ids)} SKU IDs entered")
+        batch_size = st.number_input("Batch size", min_value=1, max_value=50, value=10)
+    else:
+        url_input = st.text_area(
+            "Enter Image URLs (one per line)",
+            height=150,
+            placeholder="https://example.com/image1.jpg\nhttps://example.com/image2.jpg"
+        )
+        image_urls = [u.strip() for u in url_input.split('\n') if u.strip()]
+        st.info(f"📊 {len(image_urls)} URLs entered")
+        batch_size = st.number_input("Batch size", min_value=1, max_value=50, value=10)
     
     mode = st.selectbox("Enhancement Mode", ["auto", "full", "light_correction", "upscale"])
     
@@ -1385,12 +1211,21 @@ def render_batch_process():
         try:
             api_url = f"http://localhost:{config.api.port}"
             
-            payload = {
-                "mode": mode,
-                "batch_size": batch_size,
-                "auto_mode": True,
-                "limit": limit
-            }
+            payload = {"mode": mode, "batch_size": batch_size}
+            
+            if input_type == "AUTO":
+                payload["auto_mode"] = True
+                payload["limit"] = limit
+            elif input_type == "SKU IDs":
+                if not sku_ids:
+                    st.error("Please enter at least one SKU ID")
+                    return
+                payload["sku_ids"] = sku_ids
+            else:
+                if not image_urls:
+                    st.error("Please enter at least one image URL")
+                    return
+                payload["image_urls"] = image_urls
             
             with st.spinner("Creating batch job..."):
                 response = requests.post(f"{api_url}/api/v1/batch/process", json=payload)
@@ -1399,8 +1234,6 @@ def render_batch_process():
                     result = response.json()
                     st.success(f"✅ Batch job created! Job ID: {result['job_id']}")
                     st.info(f"📊 Total images: {result['total_images']} | Batch size: {result['batch_size']}")
-                    if use_gemini:
-                        st.success("🤖 Using Gemini AI for enhancement")
                     st.session_state.refresh_batch_jobs = True
                 else:
                     st.error(f"Error: {response.text}")
@@ -1580,62 +1413,85 @@ def render_batch_import():
 
 def main():
     """Main dashboard"""
-    # Top Header - MedikaBazaar Style
+    # Professional Header with gradient background
     st.markdown("""
-    <div class="top-header">
-        <div style="display: flex; align-items: center; gap: 1rem;">
-            <div>
-                <h1 style="margin: 0;">Image Enhancement Pipeline</h1>
-                <p style="margin: 0;">AI-Powered B2B Healthcare Marketplace • MedikaBazaar</p>
-            </div>
-        </div>
+    <div class="main-header">
+        <h1>🖼️ Image Enhancement Pipeline</h1>
+        <p>AI-Powered B2B Marketplace Image Optimization • MedikaBazaar</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # Sidebar Navigation with Box Menu
+    # Sidebar
     with st.sidebar:
-        st.markdown("""
-        <div style="text-align: center; padding: 0.0rem 0 0rem 0;">
-            <img src="https://play-lh.googleusercontent.com/DJp5dMm6hA0Ejig1J9sFj6oAEOj9YN7ahpFP2FzGFUSp5xYy4Yt0s4Ag9h792Z7kBdY" alt="MedikaBazaar" style="width: 50px; height: 50px; margin-bottom: 0.3rem;">
-            <p style="font-size: 0.75rem; color: #6c757d; margin: 0;">Medikabazaar</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("### 🎛️ Control Panel")
         st.markdown("---")
-        st.markdown("")
         
-        # Menu items with icons
-        menu_items = [
-            ("📊 Dashboard", "dashboard"),
-            ("🚀 Quick Enhance", "quick"),
-            ("📦 Batch Process", "batch"),
-            ("📋 Open Tasks", "tasks"),
-            ("✅ Completed Tasks", "approved"),
-            ("📥 Batch Import", "import"),
-            ("🕐 History", "history"),
-            ("📋 Batch Jobs", "jobs")
-        ]
+        # Status indicator
+        st.markdown("#### 📡 System Status")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("🟢 **API**")
+        with col2:
+            # Check S3 status
+            s3_status = "🟢" if s3_service.is_available() else "🔴"
+            st.markdown(f"{s3_status} **S3**")
         
-        for item, key in menu_items:
-            if st.button(item, key=f"nav_{key}", use_container_width=True):
-                st.session_state.current_page = item
+        st.markdown("---")
+        
+        st.markdown("#### 🔗 API Endpoints")
+        st.code("POST /api/v1/enhance/url", language=None)
+        st.code("POST /api/v1/enhance/upload", language=None)
+        
+        st.markdown("---")
+        
+        st.markdown("#### 📚 Documentation")
+        st.markdown("• [📄 API Docs](http://localhost:8000/docs)")
+        st.markdown("• [❤️ Health Check](http://localhost:8000/health)")
+        st.markdown("• [📊 Stats](http://localhost:8000/api/v1/stats)")
+        
+        st.markdown("---")
+        
+        if st.button("🔄 Refresh Dashboard", use_container_width=True):
+            st.rerun()
+        
+        st.markdown("---")
+        st.markdown(
+            "<div style='text-align: center; color: #6c757d; font-size: 0.8rem;'>"
+            "v2.0.0 • Built with ❤️"
+            "</div>",
+            unsafe_allow_html=True
+        )
     
-    # Render selected page
-    page = st.session_state.current_page
+    # Main content - KPI cards
+    render_kpi_cards()
     
-    if page == "🚀 Quick Enhance":
+    st.markdown("---")
+    
+    # Tabs for different views
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "🚀 Quick Enhance",
+        "📊 Analytics", 
+        "✅ My Tasks",
+        "✅ Approved",
+        "📦 Batch Process",
+        "📦 Batch Import",
+        "🕐 History",
+        "📋 Batch Jobs"
+    ])
+    
+    with tab1:
         render_single_enhancement()
-    elif page == "📊 Dashboard":
-        # KPI cards for Dashboard
-        render_kpi_cards()
-        st.markdown("---")
-        
+    
+    with tab2:
         col1, col2 = st.columns(2)
         with col1:
             render_quality_distribution()
         with col2:
+            # Processing stats over time (if data available)
             db = get_db()
             try:
                 from sqlalchemy import func
+                # Query only date and count - quality_improvement is in ImageMetrics table
                 results = db.query(
                     func.date(ImageRecord.processed_at).label('date'),
                     func.count(ImageRecord.id).label('count')
@@ -1648,38 +1504,60 @@ def main():
                 ).all()
                 
                 if results:
-                    df = pd.DataFrame([{'Date': r.date, 'Count': r.count} for r in results])
-                    fig = px.bar(df, x='Date', y='Count', title="📈 Images Processed Per Day", color_discrete_sequence=['#0077b6'])
-                    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+                    df = pd.DataFrame([
+                        {'Date': r.date, 'Count': r.count}
+                        for r in results
+                    ])
+                    
+                    fig = px.bar(
+                        df, x='Date', y='Count', 
+                        title="📈 Images Processed Per Day",
+                        color_discrete_sequence=['#667eea']
+                    )
+                    fig.update_layout(
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        paper_bgcolor='rgba(0,0,0,0)',
+                    )
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("📊 No processing data available yet. Enhance some images to see analytics!")
             finally:
                 db.close()
-    elif page == "📋 Open Tasks":
+    
+    with tab3:
         render_my_tasks()
-    elif page == "✅ Completed Tasks":
+    
+    with tab4:
         render_approved_tasks()
-    elif page == "📦 Batch Process":
+    
+    with tab5:
         render_batch_process()
-    elif page == "📥 Batch Import":
+    
+    with tab6:
         render_batch_import()
-    elif page == "🕐 History":
+    
+    with tab7:
         render_recent_images()
-    elif page == "📋 Batch Jobs":
+    
+    with tab8:
         st.header("📋 Batch Jobs")
+        
         try:
             response = requests.get(f"http://localhost:{config.api.port}/api/v1/batch/jobs?limit=100")
             if response.status_code == 200:
                 data = response.json()
                 jobs = data.get("jobs", [])
+                
                 if jobs:
                     df = pd.DataFrame(jobs)
+                    
                     for col in ['created_at', 'started_at', 'completed_at']:
                         if col in df.columns:
                             df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
+                    
                     display_cols = ['job_id', 'status', 'total_images', 'processed_count', 'success_count', 'failed_count', 'skipped_count', 'progress_percent', 'created_at', 'started_at', 'completed_at']
                     available_cols = [col for col in display_cols if col in df.columns]
+                    
                     st.dataframe(df[available_cols], use_container_width=True, height=600)
                     st.caption(f"📊 Total Jobs: {len(jobs)}")
                 else:

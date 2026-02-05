@@ -692,6 +692,7 @@ class ProductImageRepository:
             "qc_counts": qc_counts,
             "avg_quality_improvement": round(avg_improvement, 2) if avg_improvement else None,
             "avg_size_reduction": round(avg_size_reduction, 2) if avg_size_reduction else None,
+            "quality_distribution": {},
         }
 
 
