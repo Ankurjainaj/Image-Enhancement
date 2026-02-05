@@ -528,7 +528,7 @@ class ImageEnhancer:
                     bg_mask = transformed_mask
                 # If AI was used (especially upscaling), preserve the high resolution
                 # Only standardize aspect ratio/padding, but don't downscale
-                enhanced = self.standardize_image(enhanced, config, maintain_resolution=result.ai_used)
+                enhanced, unused_mask = self.standardize_image(enhanced, config, mask = transformed_mask, maintain_resolution=result.ai_used)
                 enhancements.append("standardization")
                 logger.info(f"   ✅ Standardization Complete | Time: {int((time.time() - step_start) * 1000)}ms")
             
@@ -1159,8 +1159,9 @@ class ImageEnhancer:
         self, 
         img: np.ndarray, 
         config: Optional[StandardizationConfig] = None,
+        mask: Optional[np.ndarray] = None,
         maintain_resolution: bool = False
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """Standardize image dimensions"""
         config = config or StandardizationConfig()
         h, w = img.shape[:2]

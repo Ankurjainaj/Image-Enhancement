@@ -1331,7 +1331,7 @@ def render_approved_tasks():
                                 img_bytes = get_image_from_url(original_url, timeout=10)
                                 if img_bytes:
                                     img = Image.open(io.BytesIO(img_bytes))
-                                    st.image(img, use_container_width=True)
+                                    st.image(img, use_column_width=True)
                                     st.caption(f"🔗 {original_url}")
                                 else:
                                     st.warning("❌ Cannot load")
@@ -1345,7 +1345,7 @@ def render_approved_tasks():
                                 img_bytes = get_image_from_url(enhanced_url, timeout=10)
                                 if img_bytes:
                                     img = Image.open(io.BytesIO(img_bytes))
-                                    st.image(img, use_container_width=True)
+                                    st.image(img, use_column_width=True)
                                     st.caption(f"🔗 {enhanced_url}")
                                 else:
                                     st.warning("❌ Cannot load")
