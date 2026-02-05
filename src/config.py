@@ -227,13 +227,20 @@ class StorageConfig:
         default_factory=lambda: Path(__file__).parent.parent / "data" / "enhanced"
     )
     
+    # S3 Configuration
     s3_bucket: str = field(default_factory=lambda: os.getenv("S3_BUCKET", ""))
     s3_prefix: str = "enhanced/"
     s3_region: str = field(default_factory=lambda: os.getenv("AWS_REGION", "ap-south-1"))
+    s3_endpoint: str = field(default_factory=lambda: os.getenv("S3_ENDPOINT", ""))
+    s3_access_key: str = field(default_factory=lambda: os.getenv("AWS_ACCESS_KEY_ID", ""))
+    s3_secret_key: str = field(default_factory=lambda: os.getenv("AWS_SECRET_ACCESS_KEY", ""))
     
     cloudfront_domain: str = field(
         default_factory=lambda: os.getenv("CLOUDFRONT_DOMAIN", "")
     )
+    
+    # Storage options
+    use_s3_only: bool = field(default_factory=lambda: os.getenv("USE_S3_ONLY", "false").lower() == "true")
     
     @property
     def use_s3(self) -> bool:
@@ -254,6 +261,10 @@ class APIConfig:
     allowed_extensions: tuple = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff")
     
     cors_origins: list = field(default_factory=lambda: ["*"])
+    
+    # Gemini API configuration
+    gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    enable_gemini: bool = field(default_factory=lambda: bool(os.getenv("GEMINI_API_KEY")))
 
 
 @dataclass

@@ -328,6 +328,90 @@ class ProcessingJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
+
+class EnhancementHistory(Base):
+    """Enhancement History - audit trail of all image enhancements with metadata"""
+    __tablename__ = "enhancement_history"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    
+    # Reference to original image
+    product_image_id = Column(String(36), ForeignKey("product_images.id"), nullable=False, index=True)
+    product_image = relationship("ProductImage")
+    
+    # Enhancement tracking
+    enhancement_sequence = Column(Integer, nullable=False)  # 1st, 2nd, 3rd enhancement, etc.
+    enhancement_mode = Column(String(50), nullable=False)  # "local", "gemini", "bedrock", etc.
+    enhancement_prompt = Column(Text, nullable=True)  # For AI models
+    
+    # Original image metadata (at time of enhancement)
+    original_s3_url = Column(String(2048), nullable=True)  # S3 URL for original image
+    original_https_url = Column(String(2048), nullable=True)  # HTTPS/CloudFront URL for original
+    original_size_bytes = Column(BigInteger, nullable=True)
+    original_quality_score = Column(Float, nullable=True)
+    original_blur_score = Column(Float, nullable=True)
+    original_width = Column(Integer, nullable=True)
+    original_height = Column(Integer, nullable=True)
+    original_format = Column(String(20), nullable=True)
+    
+    # Enhanced image metadata
+    enhanced_s3_url = Column(String(2048), nullable=True)  # S3 URL for enhanced image
+    enhanced_https_url = Column(String(2048), nullable=True)  # HTTPS/CloudFront URL
+    enhanced_size_bytes = Column(BigInteger, nullable=True)
+    enhanced_quality_score = Column(Float, nullable=True)
+    enhanced_blur_score = Column(Float, nullable=True)
+    enhanced_width = Column(Integer, nullable=True)
+    enhanced_height = Column(Integer, nullable=True)
+    enhanced_format = Column(String(20), nullable=True)
+    
+    # Metadata captured during enhancement
+    enhancements_applied = Column(JSON, nullable=True)  # ["bg_removal", "upscale", etc.]
+    quality_metadata = Column(JSON, nullable=True)  # {"original_blur": 50, "enhanced_blur": 85, ...}
+    size_metadata = Column(JSON, nullable=True)  # {"reduction_percent": 25, "saved_kb": 150}
+    
+    # Processing details
+    processing_time_ms = Column(Integer, nullable=True)
+    processing_status = Column(String(20), default="completed", index=True)
+    error_message = Column(Text, nullable=True)
+    
+    # API/Service used
+    api_endpoint = Column(String(255), nullable=True)
+    model_version = Column(String(100), nullable=True)  # Gemini version, etc.
+    response_id = Column(String(100), nullable=True)
+    
+    # User/Request info
+    user_id = Column(String(100), nullable=True)
+    request_ip = Column(String(45), nullable=True)
+    user_agent = Column(String(500), nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    __table_args__ = (
+        Index("ix_enhancement_history_product_image", "product_image_id"),
+        Index("ix_enhancement_history_created", "created_at"),
+        Index("ix_enhancement_history_status", "processing_status"),
+        Index("ix_enhancement_history_mode", "enhancement_mode"),
+    )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "product_image_id": self.product_image_id,
+            "enhancement_sequence": self.enhancement_sequence,
+            "enhancement_mode": self.enhancement_mode,
+            "original_size_bytes": self.original_size_bytes,
+            "enhanced_size_bytes": self.enhanced_size_bytes,
+            "original_quality_score": self.original_quality_score,
+            "enhanced_quality_score": self.enhanced_quality_score,
+            "enhanced_s3_url": self.enhanced_s3_url,
+            "enhanced_https_url": self.enhanced_https_url,
+            "processing_time_ms": self.processing_time_ms,
+            "processing_status": self.processing_status,
+            "enhancements_applied": self.enhancements_applied,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
     @property
     def progress_percentage(self) -> float:
         if self.total_images == 0:
@@ -722,6 +806,78 @@ class ImageMetricsRepository:
             self.db.refresh(existing)
             return existing
         return self.create(image_id=image_id, **kwargs)
+
+
+class EnhancementHistoryRepository:
+    """Repository for tracking image enhancement history and audit trail"""
+    
+    def __init__(self, db: Session):
+        self.db = db
+    
+    def create(self, **kwargs) -> EnhancementHistory:
+        """Create a new enhancement history record"""
+        history = EnhancementHistory(**kwargs)
+        self.db.add(history)
+        self.db.commit()
+        self.db.refresh(history)
+        return history
+    
+    def get_by_id(self, history_id: int) -> Optional[EnhancementHistory]:
+        """Get enhancement history by ID"""
+        return self.db.query(EnhancementHistory).filter(EnhancementHistory.id == history_id).first()
+    
+    def get_by_product_image_id(self, product_image_id: int, limit: int = 100) -> list:
+        """Get all enhancements for a product image, ordered by sequence"""
+        return self.db.query(EnhancementHistory)\
+            .filter(EnhancementHistory.product_image_id == product_image_id)\
+            .order_by(EnhancementHistory.enhancement_sequence.desc())\
+            .limit(limit)\
+            .all()
+    
+    def get_latest_enhancement(self, product_image_id: int) -> Optional[EnhancementHistory]:
+        """Get the most recent enhancement for a product image"""
+        return self.db.query(EnhancementHistory)\
+            .filter(EnhancementHistory.product_image_id == product_image_id)\
+            .order_by(EnhancementHistory.enhancement_sequence.desc())\
+            .first()
+    
+    def get_by_enhancement_mode(self, product_image_id: int, mode: str) -> list:
+        """Get all enhancements for an image using specific mode (local, gemini, bedrock)"""
+        return self.db.query(EnhancementHistory)\
+            .filter(
+                EnhancementHistory.product_image_id == product_image_id,
+                EnhancementHistory.enhancement_mode == mode
+            )\
+            .order_by(EnhancementHistory.enhancement_sequence.desc())\
+            .all()
+    
+    def list_by_processing_status(self, status: str, limit: int = 50) -> list:
+        """Get enhancements by processing status (processing, completed, failed)"""
+        return self.db.query(EnhancementHistory)\
+            .filter(EnhancementHistory.processing_status == status)\
+            .order_by(EnhancementHistory.created_at.desc())\
+            .limit(limit)\
+            .all()
+    
+    def update_status(self, history_id: int, status: str, details: str = None) -> EnhancementHistory:
+        """Update processing status and optional details"""
+        record = self.get_by_id(history_id)
+        if record:
+            record.processing_status = status
+            if details:
+                record.processing_details = details
+            self.db.commit()
+            self.db.refresh(record)
+        return record
+    
+    def delete(self, history_id: int) -> bool:
+        """Delete an enhancement history record"""
+        record = self.get_by_id(history_id)
+        if record:
+            self.db.delete(record)
+            self.db.commit()
+            return True
+        return False
 
 
 # Backward compatibility aliases

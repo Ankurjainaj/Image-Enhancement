@@ -17,11 +17,13 @@ from pydantic import BaseModel, HttpUrl, Field
 import redis
 
 from src.config import get_config, EnhancementMode, ProcessingStatus
-from src.database import init_db, get_db, ImageRepository, JobRepository, ImageRecord
+from src.database import init_db, get_db, ImageRepository, JobRepository, ImageRecord, EnhancementHistoryRepository
 from src.enhancer import ImageEnhancer, EnhancementResult
 from src.quality import QualityAssessor, QualityReport
 from src.kafka_service import KafkaProducerService, ImageJob, create_image_jobs
 from src.logging_config import setup_logging
+from src.gemini_service import GeminiService
+from src.s3_service import S3Service
 
 # Initialize logging
 setup_logging(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -43,6 +45,7 @@ class EnhanceResponse(BaseModel):
     """Response from enhancement operation"""
     success: bool
     image_id: str
+    database_id: Optional[str] = None
     original_url: Optional[str] = None
     enhanced_url: Optional[str] = None
     original_size_kb: float
@@ -52,8 +55,9 @@ class EnhanceResponse(BaseModel):
     quality_after: Optional[float] = None
     quality_improvement: Optional[float] = None
     processing_time_ms: int
-    enhancements_applied: List[str]
-    dimensions: Dict[str, int]
+    enhancement_mode: Optional[str] = None
+    enhancements_applied: List[str] = []
+    dimensions: Dict[str, int] = {}
     error: Optional[str] = None
 
 
@@ -96,6 +100,25 @@ class ImportUrlsRequest(BaseModel):
     urls: List[str]
     category: Optional[str] = None
     source_type: str = "cloudfront"
+
+
+class GeminiEnhanceRequest(BaseModel):
+    """Request to enhance image using Gemini API"""
+    enhancement_prompt: Optional[str] = Field(
+        None,
+        description="Custom prompt for Gemini enhancement. If not provided, uses default quality enhancement prompt"
+    )
+
+
+class GeminiEnhanceResponse(BaseModel):
+    """Response from Gemini enhancement"""
+    success: bool
+    enhanced_image_base64: Optional[str] = None
+    processing_time_ms: int
+    model_version: Optional[str] = None
+    response_id: Optional[str] = None
+    usage_metadata: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
 
 class StatsResponse(BaseModel):
@@ -260,11 +283,13 @@ async def enhance_upload(
     """
     Enhance an uploaded image
     
-    - Upload image file directly
+    - Upload image file to S3
+    - Save record with URLs to database
     - Returns enhanced image as download or base64
     """
     start_time = time.time()
     image_id = str(uuid.uuid4())
+    db = None
     
     # Validate file type
     if not file.content_type or not file.content_type.startswith('image/'):
@@ -274,6 +299,36 @@ async def enhance_upload(
         # Read uploaded file
         content = await file.read()
         original_size = len(content)
+        mime_type = file.content_type
+        
+        logger.info(f"[UPLOAD] File received: {file.filename}, size: {original_size} bytes")
+        
+        # Initialize S3 and database
+        s3_service = S3Service(
+            bucket=config.storage.s3_bucket,
+            region=config.storage.s3_region,
+            endpoint_url=config.storage.s3_endpoint if config.storage.s3_endpoint else None,
+            access_key=config.storage.s3_access_key,
+            secret_key=config.storage.s3_secret_key
+        )
+        
+        db = get_db()
+        image_repo = ImageRepository(db)
+        
+        # Upload original image to S3
+        original_key = f"uploads/original/{image_id}_{file.filename}"
+        original_s3_url = s3_service.upload_image(
+            content,
+            original_key,
+            mime_type,
+            metadata={
+                "filename": file.filename,
+                "source": "upload",
+                "type": "original"
+            }
+        )
+        original_https_url = s3_service.get_https_url(original_key, cloudfront_domain=None)
+        logger.info(f"[UPLOAD] Original uploaded to S3: {original_key}")
         
         # Assess quality before
         quality_before = assessor.quick_assess(content)
@@ -293,54 +348,111 @@ async def enhance_upload(
         enhanced_bytes = enhancer.get_enhanced_bytes(result, output_format, target_size_kb)
         quality_after = assessor.quick_assess(enhanced_bytes)
         
-        # Save to database
-        db = get_db()
-        try:
-            repo = ImageRepository(db)
-            repo.create(
-                id=image_id,
-                original_url=f"upload://{file.filename}",
-                original_filename=file.filename,
-                original_width=result.original_dimensions[0],
-                original_height=result.original_dimensions[1],
-                original_size_bytes=original_size,
-                enhanced_width=result.enhanced_dimensions[0],
-                enhanced_height=result.enhanced_dimensions[1],
-                enhanced_size_bytes=len(enhanced_bytes),
-                original_quality_score=quality_before.get('blur_score'),
-                status=ProcessingStatus.COMPLETED.value,
-                processing_time_ms=result.processing_time_ms,
-                enhancement_mode=mode.value
-            )
-        finally:
-            db.close()
+        # Upload enhanced image to S3
+        enhanced_key = f"uploads/enhanced/{image_id}_{file.filename}"
+        enhanced_s3_url = s3_service.upload_image(
+            enhanced_bytes,
+            enhanced_key,
+            mime_type,
+            metadata={
+                "filename": file.filename,
+                "source": "upload",
+                "type": "enhanced",
+                "mode": mode.value
+            }
+        )
+        enhanced_https_url = s3_service.get_https_url(enhanced_key, cloudfront_domain=None)
+        logger.info(f"[UPLOAD] Enhanced uploaded to S3: {enhanced_key}")
+        
+        # Save to database with S3 URLs
+        product_image = image_repo.create(
+            sku_id=f"upload_{image_id}",
+            image_url=original_https_url,
+            enhanced_image_url=enhanced_https_url,
+            original_filename=file.filename,
+            original_width=result.original_dimensions[0],
+            original_height=result.original_dimensions[1],
+            original_size_bytes=original_size,
+            enhanced_width=result.enhanced_dimensions[0],
+            enhanced_height=result.enhanced_dimensions[1],
+            enhanced_size_bytes=len(enhanced_bytes),
+            original_format=mime_type.split('/')[-1].upper(),
+            enhanced_format=output_format,
+            status=ProcessingStatus.COMPLETED.value,
+            processing_time_ms=result.processing_time_ms,
+            enhancement_mode=mode.value,
+            processed_at=datetime.utcnow(),
+            enhancements_applied=result.enhancements_applied if hasattr(result, 'enhancements_applied') else None
+        )
+        logger.info(f"[UPLOAD] Database record created: {product_image.id}")
+        
+        # Create enhancement history record
+        history_repo = EnhancementHistoryRepository(db)
+        history = history_repo.create(
+            product_image_id=product_image.id,
+            enhancement_sequence=1,
+            enhancement_mode=mode.value,
+            original_s3_url=original_s3_url,
+            original_https_url=original_https_url,
+            enhanced_s3_url=enhanced_s3_url,
+            enhanced_https_url=enhanced_https_url,
+            original_size_bytes=original_size,
+            enhanced_size_bytes=len(enhanced_bytes),
+            original_quality_score=quality_before.get('blur', 0),
+            enhanced_quality_score=quality_after.get('blur', 0),
+            quality_metadata={
+                "original_blur": quality_before.get('blur', 0),
+                "enhanced_blur": quality_after.get('blur', 0),
+                "improvement_percent": (
+                    ((quality_after.get('blur', 0) - quality_before.get('blur', 0)) / 
+                     max(quality_before.get('blur', 1), 1)) * 100
+                ) if quality_before.get('blur', 0) > 0 else 0
+            },
+            size_metadata={
+                "original_size_kb": original_size / 1024,
+                "enhanced_size_kb": len(enhanced_bytes) / 1024,
+                "reduction_percent": (
+                    ((original_size - len(enhanced_bytes)) / original_size * 100) if original_size > 0 else 0
+                )
+            },
+            processing_time_ms=int((time.time() - start_time) * 1000),
+            processing_status="completed"
+        )
+        logger.info(f"[UPLOAD] Enhancement history created: {history.id}")
         
         processing_time = int((time.time() - start_time) * 1000)
         
         return EnhanceResponse(
             success=True,
-            image_id=image_id,
-            original_url=f"upload://{file.filename}",
+            image_id=product_image.id,
+            original_url=original_https_url,
+            enhanced_url=enhanced_https_url,
             original_size_kb=round(original_size / 1024, 2),
             enhanced_size_kb=round(len(enhanced_bytes) / 1024, 2),
             size_reduction_percent=result.size_reduction_percent,
-            quality_before=quality_before.get('blur_score'),
-            quality_after=quality_after.get('blur_score'),
+            quality_before=quality_before.get('blur'),
+            quality_after=quality_after.get('blur'),
             processing_time_ms=processing_time,
-            enhancements_applied=result.enhancements_applied,
-            dimensions={
-                "original_width": result.original_dimensions[0],
-                "original_height": result.original_dimensions[1],
-                "enhanced_width": result.enhanced_dimensions[0],
-                "enhanced_height": result.enhanced_dimensions[1]
-            }
+            enhancement_mode=mode.value,
+            database_id=product_image.id
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Enhancement failed: {e}")
+        logger.error(f"[UPLOAD] Enhancement failed: {e}", exc_info=True)
+        if db:
+            try:
+                db.close()
+            except:
+                pass
         raise HTTPException(500, str(e))
+    finally:
+        if db:
+            try:
+                db.close()
+            except:
+                pass
 
 
 @app.post("/api/v1/enhance/url", response_model=EnhanceResponse)
@@ -349,25 +461,30 @@ async def enhance_url(request: EnhanceUrlRequest):
     Enhance image from URL
     
     - Fetches image from provided URL
-    - Returns enhancement results and optionally the enhanced image
+    - Uploads to S3 (original & enhanced)
+    - Saves records to database
+    - Returns URLs and database ID
     """
     start_time = time.time()
     image_id = str(uuid.uuid4())
+    db = None
     
     logger.info("=" * 80)
     logger.info(f"📥 API REQUEST | enhance/url | ID: {image_id}")
     logger.info(f"   URL: {request.url}")
     logger.info(f"   Mode: {request.mode.value}")
-    logger.info(f"   Target Size: {request.target_size_kb}KB")
-    logger.info(f"   Format: {request.output_format}")
     logger.info("-" * 80)
     
     try:
-        # Fetch image
+        # Fetch image from URL
         logger.info(f"🌐 Fetching image from URL...")
         content = await fetch_image_from_url(str(request.url))
         original_size = len(content)
         logger.info(f"   ✅ Downloaded: {original_size/1024:.1f}KB")
+        
+        # Extract filename from URL
+        filename = str(request.url).split('/')[-1] or f"image_{image_id}.jpg"
+        mime_type = "image/jpeg"  # Default
         
         # Assess quality before
         quality_before = assessor.quick_assess(content)
@@ -393,70 +510,138 @@ async def enhance_url(request: EnhanceUrlRequest):
         # Assess quality after
         quality_after = assessor.quick_assess(enhanced_bytes)
         
-        # Save to local storage
-        storage_path = config.storage.local_storage_path / f"{image_id}.{request.output_format.lower()}"
-        storage_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(storage_path, 'wb') as f:
-            f.write(enhanced_bytes)
+        # Initialize S3 and database
+        s3_service = S3Service(
+            bucket=config.storage.s3_bucket,
+            region=config.storage.s3_region,
+            endpoint_url=config.storage.s3_endpoint if config.storage.s3_endpoint else None,
+            access_key=config.storage.s3_access_key,
+            secret_key=config.storage.s3_secret_key
+        )
         
-        # Calculate quality improvement
-        blur_before = quality_before.get('blur_score', 0)
-        blur_after = quality_after.get('blur_score', 0)
-        improvement = ((blur_after - blur_before) / max(blur_before, 1)) * 100 if blur_before else None
-        
-        # Save to database
         db = get_db()
-        try:
-            repo = ImageRepository(db)
-            repo.create(
-                id=image_id,
-                original_url=str(request.url),
-                original_width=result.original_dimensions[0],
-                original_height=result.original_dimensions[1],
-                original_size_bytes=original_size,
-                enhanced_local_path=str(storage_path),
-                enhanced_width=result.enhanced_dimensions[0],
-                enhanced_height=result.enhanced_dimensions[1],
-                enhanced_size_bytes=len(enhanced_bytes),
-                original_blur_score=blur_before,
-                enhanced_blur_score=blur_after,
-                quality_improvement=improvement,
-                size_reduction=result.size_reduction_percent,
-                status=ProcessingStatus.COMPLETED.value,
-                processing_time_ms=result.processing_time_ms,
-                enhancement_mode=request.mode.value
-            )
-        finally:
-            db.close()
+        image_repo = ImageRepository(db)
+        
+        # Upload original image to S3
+        original_key = f"uploads/original/{image_id}_{filename}"
+        original_s3_url = s3_service.upload_image(
+            content,
+            original_key,
+            mime_type,
+            metadata={
+                "filename": filename,
+                "source": "url",
+                "type": "original",
+                "original_url": str(request.url)
+            }
+        )
+        original_https_url = s3_service.get_https_url(original_key, cloudfront_domain=None)
+        logger.info(f"[URL-ENHANCE] Original uploaded to S3: {original_key}")
+        
+        # Upload enhanced image to S3
+        enhanced_key = f"uploads/enhanced/{image_id}_{filename}"
+        enhanced_s3_url = s3_service.upload_image(
+            enhanced_bytes,
+            enhanced_key,
+            mime_type,
+            metadata={
+                "filename": filename,
+                "source": "url",
+                "type": "enhanced",
+                "mode": request.mode.value
+            }
+        )
+        enhanced_https_url = s3_service.get_https_url(enhanced_key, cloudfront_domain=None)
+        logger.info(f"[URL-ENHANCE] Enhanced uploaded to S3: {enhanced_key}")
+        
+        # Save to database with S3 URLs
+        product_image = image_repo.create(
+            sku_id=f"url_{image_id}",
+            image_url=original_https_url,
+            enhanced_image_url=enhanced_https_url,
+            original_filename=filename,
+            original_width=result.original_dimensions[0],
+            original_height=result.original_dimensions[1],
+            original_size_bytes=original_size,
+            enhanced_width=result.enhanced_dimensions[0],
+            enhanced_height=result.enhanced_dimensions[1],
+            enhanced_size_bytes=len(enhanced_bytes),
+            original_format=mime_type.split('/')[-1].upper(),
+            enhanced_format=request.output_format,
+            status=ProcessingStatus.COMPLETED.value,
+            processing_time_ms=result.processing_time_ms,
+            enhancement_mode=request.mode.value,
+            processed_at=datetime.utcnow(),
+            enhancements_applied=result.enhancements_applied if hasattr(result, 'enhancements_applied') else None
+        )
+        logger.info(f"[URL-ENHANCE] Database record created: {product_image.id}")
+        
+        # Create enhancement history record
+        history_repo = EnhancementHistoryRepository(db)
+        history = history_repo.create(
+            product_image_id=product_image.id,
+            enhancement_sequence=1,
+            enhancement_mode=request.mode.value,
+            original_s3_url=original_s3_url,
+            original_https_url=original_https_url,
+            enhanced_s3_url=enhanced_s3_url,
+            enhanced_https_url=enhanced_https_url,
+            original_size_bytes=original_size,
+            enhanced_size_bytes=len(enhanced_bytes),
+            original_quality_score=quality_before.get('blur', 0),
+            enhanced_quality_score=quality_after.get('blur', 0),
+            quality_metadata={
+                "original_blur": quality_before.get('blur', 0),
+                "enhanced_blur": quality_after.get('blur', 0),
+                "improvement_percent": (
+                    ((quality_after.get('blur', 0) - quality_before.get('blur', 0)) / 
+                     max(quality_before.get('blur', 1), 1)) * 100
+                ) if quality_before.get('blur', 0) > 0 else 0
+            },
+            size_metadata={
+                "original_size_kb": original_size / 1024,
+                "enhanced_size_kb": len(enhanced_bytes) / 1024,
+                "reduction_percent": (
+                    ((original_size - len(enhanced_bytes)) / original_size * 100) if original_size > 0 else 0
+                )
+            },
+            processing_time_ms=int((time.time() - start_time) * 1000),
+            processing_status="completed"
+        )
+        logger.info(f"[URL-ENHANCE] Enhancement history created: {history.id}")
         
         processing_time = int((time.time() - start_time) * 1000)
         
         return EnhanceResponse(
             success=True,
-            image_id=image_id,
-            original_url=str(request.url),
-            enhanced_url=f"/api/v1/images/{image_id}/enhanced",
+            image_id=product_image.id,
+            database_id=product_image.id,
+            original_url=original_https_url,
+            enhanced_url=enhanced_https_url,
             original_size_kb=round(original_size / 1024, 2),
             enhanced_size_kb=round(len(enhanced_bytes) / 1024, 2),
             size_reduction_percent=result.size_reduction_percent,
-            quality_before=blur_before,
-            quality_after=blur_after,
-            quality_improvement=improvement,
+            quality_before=quality_before.get('blur'),
+            quality_after=quality_after.get('blur'),
             processing_time_ms=processing_time,
-            enhancements_applied=result.enhancements_applied,
-            dimensions={
-                "original_width": result.original_dimensions[0],
-                "original_height": result.original_dimensions[1],
-                "enhanced_width": result.enhanced_dimensions[0],
-                "enhanced_height": result.enhanced_dimensions[1]
-            }
+            enhancement_mode=request.mode.value
         )
-        
-    except httpx.HTTPError as e:
-        raise HTTPException(400, f"Failed to fetch image from URL: {e}")
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Enhancement failed: {e}")
+        logger.error(f"[URL-ENHANCE] Enhancement failed: {e}", exc_info=True)
+        if db:
+            try:
+                db.close()
+            except:
+                pass
         raise HTTPException(500, str(e))
+    finally:
+        if db:
+            try:
+                db.close()
+            except:
+                pass
 
 
 @app.get("/api/v1/images/{image_id}/enhanced")
@@ -498,6 +683,70 @@ async def get_enhanced_image(image_id: str):
         db.close()
 
 
+class EnhancementHistoryItem(BaseModel):
+    """Enhancement history item in response"""
+    id: int
+    enhancement_sequence: int
+    enhancement_mode: str
+    enhanced_https_url: str
+    enhanced_s3_url: str
+    quality_metadata: Dict[str, Any]
+    size_metadata: Dict[str, Any]
+    model_version: str
+    processing_time_ms: int
+    created_at: datetime
+
+
+class EnhancementHistoryResponse(BaseModel):
+    """Response with enhancement history for an image"""
+    image_id: int
+    filename: str
+    original_https_url: str
+    enhancements: List[EnhancementHistoryItem]
+    total_enhancements: int
+
+
+@app.get("/api/v1/images/{image_id}/enhancement-history", response_model=EnhancementHistoryResponse)
+async def get_enhancement_history(image_id: int):
+    """Get complete enhancement history for an image with all metadata"""
+    db = get_db()
+    try:
+        image_repo = ImageRepository(db)
+        history_repo = EnhancementHistoryRepository(db)
+        
+        image = image_repo.get_by_id(str(image_id))
+        if not image:
+            raise HTTPException(404, "Image not found")
+        
+        enhancements = history_repo.get_by_product_image_id(image_id)
+        
+        enhancement_items = [
+            EnhancementHistoryItem(
+                id=e.id,
+                enhancement_sequence=e.enhancement_sequence,
+                enhancement_mode=e.enhancement_mode,
+                enhanced_https_url=e.enhanced_https_url,
+                enhanced_s3_url=e.enhanced_s3_url,
+                quality_metadata=e.quality_metadata,
+                size_metadata=e.size_metadata,
+                model_version=e.model_version,
+                processing_time_ms=e.processing_time_ms,
+                created_at=e.created_at
+            )
+            for e in enhancements
+        ]
+        
+        return EnhancementHistoryResponse(
+            image_id=image_id,
+            filename=image.filename,
+            original_https_url=image.https_url or image.s3_url,
+            enhancements=enhancement_items,
+            total_enhancements=len(enhancement_items)
+        )
+    finally:
+        db.close()
+
+
 @app.post("/api/v1/assess", response_model=Dict[str, Any])
 async def assess_quality(request: QualityAssessRequest):
     """Assess image quality from URL"""
@@ -514,6 +763,191 @@ async def assess_quality(request: QualityAssessRequest):
         raise HTTPException(400, f"Failed to fetch image: {e}")
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+@app.post("/api/v1/enhance/gemini", response_model=GeminiEnhanceResponse)
+async def enhance_gemini(
+    file: UploadFile = File(...),
+    enhancement_prompt: Optional[str] = Form(None)
+):
+    """
+    Enhance an uploaded image using Google Gemini API
+    
+    - Upload image file to S3
+    - Gemini will process and enhance the image based on the prompt
+    - Store enhanced image to S3
+    - Track enhancement in audit trail with metadata
+    """
+    if not config.api.enable_gemini:
+        raise HTTPException(
+            503,
+            "Gemini API is not enabled. Please set GEMINI_API_KEY environment variable."
+        )
+    
+    start_time = time.time()
+    db = None
+    
+    # Validate file type
+    if not file.content_type or not file.content_type.startswith('image/'):
+        raise HTTPException(400, "Invalid file type. Must be an image.")
+    
+    try:
+        # Read uploaded file
+        content = await file.read()
+        
+        db = get_db()
+        
+        # Check S3 configuration
+        if not config.storage.s3_bucket:
+            logger.warning("[GEMINI] S3 bucket not configured, skipping S3 upload")
+            raise HTTPException(503, "S3 storage not configured. Set S3_BUCKET environment variable.")
+        
+        # Initialize services
+        s3_service = S3Service(
+            bucket=config.storage.s3_bucket,
+            region=config.storage.s3_region,
+            endpoint_url=config.storage.s3_endpoint if config.storage.s3_endpoint else None,
+            access_key=config.storage.s3_access_key,
+            secret_key=config.storage.s3_secret_key
+        )
+        gemini_service = GeminiService(config.api.gemini_api_key)
+        
+        logger.info(f"[GEMINI] Services initialized successfully")
+        
+        # Generate S3 keys
+        original_key = f"originals/{uuid.uuid4()}_{file.filename}"
+        enhanced_key = f"enhanced/{uuid.uuid4()}_{file.filename}"
+        
+        # Get file size and type
+        file_size_kb = len(content) / 1024
+        mime_type = file.content_type
+        
+        # Upload original to S3
+        original_s3_url = s3_service.upload_image(
+            content,
+            original_key,
+            mime_type,
+            metadata={
+                "filename": file.filename,
+                "source": "upload",
+                "type": "original"
+            }
+        )
+        original_https_url = s3_service.get_https_url(original_key, config.storage.cloudfront_domain)
+        
+        # Enhance using Gemini
+        result = gemini_service.enhance_image(content, enhancement_prompt=enhancement_prompt)
+        
+        if not result.success:
+            raise HTTPException(500, f"Gemini enhancement failed: {result.error}")
+        
+        # Decode enhanced image from base64
+        enhanced_image_bytes = result.get_image_bytes()
+        enhanced_size_kb = len(enhanced_image_bytes) / 1024
+        
+        # Upload enhanced to S3
+        enhanced_s3_url = s3_service.upload_image(
+            enhanced_image_bytes,
+            enhanced_key,
+            mime_type,
+            metadata={
+                "filename": file.filename,
+                "source": "gemini",
+                "type": "enhanced",
+                "original_key": original_key,
+                "model": result.model_version
+            }
+        )
+        enhanced_https_url = s3_service.get_https_url(enhanced_key, config.storage.cloudfront_domain)
+        
+        processing_time = int((time.time() - start_time) * 1000)
+        
+        # Assess quality of both images
+        quality_assessor = QualityAssessor()
+        original_quality = quality_assessor.quick_assess(content)
+        enhanced_quality = quality_assessor.quick_assess(enhanced_image_bytes)
+        
+        # Create or get product image record
+        image_repo = ImageRepository(db)
+        logger.info("[GEMINI] Creating product image record...")
+        product_image = image_repo.create(
+            sku_id=f"upload_{uuid.uuid4()}",
+            image_url=original_https_url,
+            enhanced_image_url=enhanced_https_url,
+            original_filename=file.filename,
+            original_size_bytes=len(content),
+            enhanced_size_bytes=len(enhanced_image_bytes),
+            original_format=mime_type.split('/')[-1].upper(),
+            enhanced_format=mime_type.split('/')[-1].upper(),
+            enhancement_mode="gemini",
+            status=ProcessingStatus.COMPLETED.value,
+            processed_at=datetime.utcnow(),
+            processing_time_ms=processing_time
+        )
+        logger.info(f"[GEMINI] Product image created with ID: {product_image.id}")
+        
+        # Get enhancement sequence number
+        history_repo = EnhancementHistoryRepository(db)
+        latest = history_repo.get_latest_enhancement(product_image.id)
+        sequence = (latest.enhancement_sequence + 1) if latest else 1
+        
+        # Store enhancement history with metadata
+        quality_metadata = {
+            "original_blur": original_quality.get('blur', 0),
+            "enhanced_blur": enhanced_quality.get('blur', 0),
+            "improvement_percent": (
+                ((enhanced_quality.get('blur', 0) - original_quality.get('blur', 0)) / 
+                 max(original_quality.get('blur', 1), 1)) * 100
+            ) if original_quality.get('blur', 0) > 0 else 0
+        }
+        
+        size_metadata = {
+            "original_size_kb": file_size_kb,
+            "enhanced_size_kb": enhanced_size_kb,
+            "reduction_percent": (
+                ((file_size_kb - enhanced_size_kb) / file_size_kb * 100) if file_size_kb > 0 else 0
+            )
+        }
+        
+        enhancement_history = history_repo.create(
+            product_image_id=product_image.id,
+            enhancement_sequence=sequence,
+            enhancement_mode="gemini",
+            original_s3_url=original_s3_url,
+            original_https_url=original_https_url,
+            enhanced_s3_url=enhanced_s3_url,
+            enhanced_https_url=enhanced_https_url,
+            quality_metadata=quality_metadata,
+            size_metadata=size_metadata,
+            model_version=result.model_version,
+            response_id=result.response_id,
+            processing_time_ms=processing_time,
+            processing_status="completed"
+        )
+        logger.info(f"[GEMINI] Enhancement history created with ID: {enhancement_history.id}")
+        
+        return GeminiEnhanceResponse(
+            success=True,
+            enhanced_image_base64=result.enhanced_image_base64,
+            processing_time_ms=processing_time,
+            model_version=result.model_version,
+            response_id=result.response_id,
+            usage_metadata=result.usage_metadata
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Gemini enhancement failed: {e}", exc_info=True)
+        db.close() if db else None
+        raise HTTPException(500, str(e))
+    finally:
+        if db:
+            try:
+                db.close()
+            except:
+                pass
+
 
 
 @app.post("/api/v1/batch", response_model=BatchJobResponse)

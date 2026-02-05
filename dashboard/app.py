@@ -16,9 +16,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 from PIL import Image
-
-# Add parent directory to path
+# Add parent directory to path so `src` package is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.logging_config import setup_logging
+import logging
+
+# Initialize logging for dashboard
+setup_logging(level="INFO")
+logger = logging.getLogger(__name__)
 
 from src.config import get_config, ProcessingStatus, EnhancementMode
 from src.database import init_db, get_db, ImageRepository, ImageRecord
@@ -256,13 +262,13 @@ def display_comparison(original_bytes: bytes, enhanced_bytes: bytes, metrics: di
     
     with col1:
         st.subheader("📷 Original")
-        st.image(original_bytes, use_column_width=True)
+        st.image(original_bytes, use_container_width=True)
         st.caption(f"Size: {len(original_bytes)/1024:.1f} KB | "
                   f"Blur Score: {metrics.get('original_blur', 'N/A'):.1f}")
     
     with col2:
         st.subheader("✨ Enhanced")
-        st.image(enhanced_bytes, use_column_width=True)
+        st.image(enhanced_bytes, use_container_width=True)
         st.caption(f"Size: {len(enhanced_bytes)/1024:.1f} KB | "
                   f"Blur Score: {metrics.get('enhanced_blur', 'N/A'):.1f}")
 
@@ -350,7 +356,7 @@ def render_quality_distribution():
                 title="Quality Distribution (Original Images)",
                 showlegend=True
             )
-            st.plotly_chart(fig, use_column_width=True)
+            st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No quality data available yet. Process some images first!")
     finally:
@@ -374,19 +380,16 @@ def render_recent_images():
                     
                     with col1:
                         st.write("**Original URL:**")
-                        st.code(img.original_url[:100] + "..." if len(img.original_url) > 100 else img.original_url)
+                        st.code(img.image_url[:100] + "..." if len(img.image_url) > 100 else img.image_url)
                         st.write(f"Size: {img.original_size_bytes/1024:.1f} KB" if img.original_size_bytes else "N/A")
-                        st.write(f"Blur Score: {img.original_blur_score:.1f}" if img.original_blur_score else "N/A")
+                        st.write(f"Format: {img.original_format}" if img.original_format else "N/A")
                     
                     with col2:
-                        if img.enhanced_local_path:
-                            st.write("**Enhanced:**")
+                        if img.enhanced_image_url:
+                            st.write("**Enhanced URL:**")
+                            st.code(img.enhanced_image_url[:100] + "..." if len(img.enhanced_image_url) > 100 else img.enhanced_image_url)
                             st.write(f"Size: {img.enhanced_size_bytes/1024:.1f} KB" if img.enhanced_size_bytes else "N/A")
-                            st.write(f"Blur Score: {img.enhanced_blur_score:.1f}" if img.enhanced_blur_score else "N/A")
-                            if img.quality_improvement:
-                                st.write(f"**Quality Improvement: +{img.quality_improvement:.1f}%**")
-                            if img.size_reduction:
-                                st.write(f"**Size Reduction: -{img.size_reduction:.1f}%**")
+                            st.write(f"Format: {img.enhanced_format}" if img.enhanced_format else "N/A")
         else:
             st.info("No processed images yet.")
     finally:
@@ -417,6 +420,8 @@ def render_single_enhancement():
                     help="Remove cluttered backgrounds, replace with clean white")
                 light_correct = st.checkbox("💡 Light & Color Correction", value=True,
                     help="Fix exposure, brightness, and color balance")
+                use_gemini = st.checkbox("🤖 Gemini AI Enhancement", value=False,
+                    help="Use Google Gemini for intelligent image enhancement")
             with col2:
                 upscale_denoise = st.checkbox("🔍 Upscale & Denoise", value=False,
                     help="Super resolution to increase image quality without pixelation")
@@ -460,60 +465,131 @@ def render_single_enhancement():
                     # Assess original
                     original_quality = assessor.quick_assess(original_bytes)
                     
-                    # Enhance
-                    start = time.time()
-                    result = enhancer.enhance(
-                        original_bytes,
-                        mode=mode,
-                        target_size_kb=target_size,
-                        remove_background=bg_remove,
-                        standardize=standardize
-                    )
-                    elapsed = time.time() - start
-                    
-                    if result.success:
-                        enhanced_bytes = enhancer.get_enhanced_bytes(result, "JPEG", target_size)
-                        enhanced_quality = assessor.quick_assess(enhanced_bytes)
-                        
-                        # Display comparison
-                        display_comparison(
-                            original_bytes,
-                            enhanced_bytes,
-                            {
-                                'original_blur': original_quality.get('blur_score', 0),
-                                'enhanced_blur': enhanced_quality.get('blur_score', 0)
-                            }
-                        )
-                        
-                        # Metrics
-                        st.divider()
-                        col1, col2, col3, col4 = st.columns(4)
-                        
-                        with col1:
-                            reduction = (1 - len(enhanced_bytes)/len(original_bytes)) * 100
-                            st.metric("Size Reduction", f"-{reduction:.1f}%")
-                        
-                        with col2:
-                            blur_improvement = ((enhanced_quality.get('blur_score', 0) - original_quality.get('blur_score', 0)) 
-                                               / max(original_quality.get('blur_score', 1), 1)) * 100
-                            st.metric("Sharpness Boost", f"+{blur_improvement:.1f}%")
-                        
-                        with col3:
-                            st.metric("Processing Time", f"{elapsed*1000:.0f}ms")
-                        
-                        with col4:
-                            st.metric("Enhancements", len(result.enhancements_applied))
-                        
-                        # Download button
-                        st.download_button(
-                            "📥 Download Enhanced Image",
-                            enhanced_bytes,
-                            file_name=f"enhanced_{uploaded_file.name}",
-                            mime="image/jpeg",
-                            use_container_width=True
-                        )
+                    if use_gemini:
+                        # Use Gemini enhancement
+                        try:
+                            response = requests.post(
+                                "http://localhost:8000/api/v1/enhance/gemini",
+                                files={"file": (uploaded_file.name, original_bytes, uploaded_file.type)},
+                                data={"enhancement_prompt": "true color reproduction, neutral white balance, color consistency across product, enhance the quality"},
+                                timeout=300
+                            )
+                            
+                            if response.status_code == 200:
+                                result_data = response.json()
+                                enhanced_bytes = base64.b64decode(result_data.get('enhanced_image_base64'))
+                                enhanced_quality = assessor.quick_assess(enhanced_bytes)
+                                elapsed = result_data.get('processing_time_ms', 0) / 1000
+                                
+                                # Display comparison
+                                display_comparison(
+                                    original_bytes,
+                                    enhanced_bytes,
+                                    {
+                                        'original_blur': original_quality.get('blur_score', 0),
+                                        'enhanced_blur': enhanced_quality.get('blur_score', 0)
+                                    }
+                                )
+                                
+                                # Metrics
+                                st.divider()
+                                col1, col2, col3 = st.columns(3)
+                                
+                                with col1:
+                                    reduction = (1 - len(enhanced_bytes)/len(original_bytes)) * 100
+                                    st.metric("Size Reduction", f"-{reduction:.1f}%")
+                                
+                                with col2:
+                                    blur_improvement = ((enhanced_quality.get('blur_score', 0) - original_quality.get('blur_score', 0)) 
+                                                       / max(original_quality.get('blur_score', 1), 1)) * 100
+                                    st.metric("Sharpness Boost", f"+{blur_improvement:.1f}%")
+                                
+                                with col3:
+                                    st.metric("Processing Time", f"{elapsed:.0f}ms")
+                                
+                                st.info(f"🤖 Model: {result_data.get('model_version', 'Gemini')}")
+                                
+                                # Download button
+                                st.download_button(
+                                    "📥 Download Enhanced Image",
+                                    enhanced_bytes,
+                                    file_name=f"gemini_enhanced_{uploaded_file.name}",
+                                    mime="image/jpeg",
+                                    use_container_width=True
+                                )
+                            else:
+                                st.error(f"Gemini enhancement failed: {response.text}")
+                        except Exception as e:
+                            st.error(f"Error calling Gemini API: {str(e)}")
                     else:
-                        st.error(f"Enhancement failed: {result.error}")
+                        # Call API endpoint for enhancement with S3 upload
+                        try:
+                            response = requests.post(
+                                "http://localhost:8000/api/v1/enhance/upload",
+                                files={"file": (uploaded_file.name, original_bytes, uploaded_file.type)},
+                                data={
+                                    "mode": mode.value,
+                                    "target_size_kb": target_size,
+                                    "output_format": "JPEG"
+                                },
+                                timeout=300
+                            )
+                            
+                            if response.status_code == 200:
+                                result_data = response.json()
+                                
+                                if result_data.get('success'):
+                                    # Fetch enhanced image from URL
+                                    enhanced_url = result_data.get('enhanced_url')
+                                    enhanced_response = requests.get(enhanced_url, timeout=30)
+                                    enhanced_bytes = enhanced_response.content
+                                    enhanced_quality = assessor.quick_assess(enhanced_bytes)
+                                    
+                                    # Display comparison
+                                    display_comparison(
+                                        original_bytes,
+                                        enhanced_bytes,
+                                        {
+                                            'original_blur': original_quality.get('blur_score', 0),
+                                            'enhanced_blur': enhanced_quality.get('blur_score', 0)
+                                        }
+                                    )
+                                    
+                                    # Metrics
+                                    st.divider()
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    
+                                    with col1:
+                                        st.metric("Size Reduction", f"-{result_data.get('size_reduction_percent', 0):.1f}%")
+                                    
+                                    with col2:
+                                        quality_improvement = result_data.get('quality_improvement', 0)
+                                        st.metric("Quality Improvement", f"+{quality_improvement:.1f}%" if quality_improvement else "N/A")
+                                    
+                                    with col3:
+                                        st.metric("Processing Time", f"{result_data.get('processing_time_ms', 0):.0f}ms")
+                                    
+                                    with col4:
+                                        st.metric("Database ID", result_data.get('database_id', 'N/A')[:8])
+                                    
+                                    # Show S3 URLs
+                                    st.info(f"📁 Original URL: {result_data.get('original_url', 'N/A')}")
+                                    st.info(f"✨ Enhanced URL: {result_data.get('enhanced_url', 'N/A')}")
+                                    
+                                    # Download button
+                                    st.download_button(
+                                        "📥 Download Enhanced Image",
+                                        enhanced_bytes,
+                                        file_name=f"enhanced_{uploaded_file.name}",
+                                        mime="image/jpeg",
+                                        use_container_width=True
+                                    )
+                                else:
+                                    st.error(f"Enhancement failed: {result_data.get('error', 'Unknown error')}")
+                            else:
+                                st.error(f"API Error ({response.status_code}): {response.text}")
+                        except Exception as e:
+                            st.error(f"Error calling enhancement API: {str(e)}")
     
     with tab2:
         url = st.text_input(
@@ -566,63 +642,43 @@ def render_single_enhancement():
             
             mode = get_url_mode()
             
-            if st.button("✨ Enhance from URL", type="primary", use_column_width=True):
+            if st.button("✨ Enhance from URL", type="primary", use_container_width=True):
                 with st.spinner("Fetching and processing..."):
-                    original_bytes = get_image_from_url(url)
-                    
-                    if original_bytes:
-                        original_quality = assessor.quick_assess(original_bytes)
-                        
-                        start = time.time()
-                        result = enhancer.enhance(
-                            original_bytes,
-                            mode=mode,
-                            target_size_kb=target_size,
-                            remove_background=url_bg_remove,
-                            standardize=url_standardize
+                    try:
+                        response = requests.post(
+                            "http://localhost:8000/api/v1/enhance/url",
+                            json={"url": url, "mode": mode.value, "target_size_kb": target_size, "output_format": "JPEG"},
+                            timeout=300
                         )
-                        elapsed = time.time() - start
-                        
-                        if result.success:
-                            enhanced_bytes = enhancer.get_enhanced_bytes(result, "JPEG", target_size)
-                            enhanced_quality = assessor.quick_assess(enhanced_bytes)
-                            
-                            display_comparison(
-                                original_bytes,
-                                enhanced_bytes,
-                                {
-                                    'original_blur': original_quality.get('blur_score', 0),
-                                    'enhanced_blur': enhanced_quality.get('blur_score', 0)
-                                }
-                            )
-                            
-                            st.divider()
-                            col1, col2, col3, col4 = st.columns(4)
-                            
-                            with col1:
-                                reduction = (1 - len(enhanced_bytes)/len(original_bytes)) * 100
-                                st.metric("Size Reduction", f"-{reduction:.1f}%")
-                            
-                            with col2:
-                                blur_improvement = ((enhanced_quality.get('blur_score', 0) - original_quality.get('blur_score', 0)) 
-                                                   / max(original_quality.get('blur_score', 1), 1)) * 100
-                                st.metric("Sharpness Boost", f"+{blur_improvement:.1f}%")
-                            
-                            with col3:
-                                st.metric("Processing Time", f"{elapsed*1000:.0f}ms")
-                            
-                            with col4:
-                                st.metric("Enhancements", len(result.enhancements_applied))
-                            
-                            st.download_button(
-                                "📥 Download Enhanced Image",
-                                enhanced_bytes,
-                                file_name="enhanced_image.jpg",
-                                mime="image/jpeg",
-                                use_column_width=True
-                            )
+                        if response.status_code == 200:
+                            result_data = response.json()
+                            if result_data.get('success'):
+                                enhanced_response = requests.get(result_data['enhanced_url'], timeout=30)
+                                original_response = requests.get(result_data['original_url'], timeout=30)
+                                enhanced_bytes = enhanced_response.content
+                                original_bytes = original_response.content
+                                original_quality = assessor.quick_assess(original_bytes)
+                                enhanced_quality = assessor.quick_assess(enhanced_bytes)
+                                display_comparison(original_bytes, enhanced_bytes, {'original_blur': original_quality.get('blur_score', 0), 'enhanced_blur': enhanced_quality.get('blur_score', 0)})
+                                st.divider()
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("Size Reduction", f"-{result_data.get('size_reduction_percent', 0):.1f}%")
+                                with col2:
+                                    st.metric("Processing Time", f"{result_data.get('processing_time_ms', 0):.0f}ms")
+                                with col3:
+                                    st.metric("Database ID", result_data.get('database_id', 'N/A')[:8])
+                                with col4:
+                                    st.metric("S3 Status", "✓ Saved")
+                                st.info(f"📁 Original S3: {result_data.get('original_url', 'N/A')}")
+                                st.info(f"✨ Enhanced S3: {result_data.get('enhanced_url', 'N/A')}")
+                                st.download_button("📥 Download Enhanced Image", enhanced_bytes, file_name="enhanced_image.jpg", mime="image/jpeg", use_container_width=True)
+                            else:
+                                st.error(f"Enhancement failed: {result_data.get('error')}")
                         else:
-                            st.error(f"Enhancement failed: {result.error}")
+                            st.error(f"API Error ({response.status_code}): {response.text}")
+                    except Exception as e:
+                        st.error(f"Error calling API: {str(e)}")
 
 
 def render_batch_import():
@@ -823,7 +879,7 @@ def main():
                         plot_bgcolor='rgba(0,0,0,0)',
                         paper_bgcolor='rgba(0,0,0,0)',
                     )
-                    st.plotly_chart(fig, use_column_width=True)
+                    st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("📊 No processing data available yet. Enhance some images to see analytics!")
             finally:
