@@ -1364,13 +1364,6 @@ def render_batch_process():
     st.subheader("📦 Batch Process")
     st.markdown("Process multiple pending images in batch mode")
     
-    # Show current processing mode
-    use_gemini = getattr(config.api, 'use_gemini_batch', False)
-    if use_gemini:
-        st.info("🤖 **Mode: Gemini AI Enhancement** (Set via USE_GEMINI_BATCH environment variable)")
-    else:
-        st.info("🔧 **Mode: Standard Enhancement Pipeline** (Set USE_GEMINI_BATCH=true to use Gemini)")
-    
     # Input section
     st.markdown("### Configuration")
     
@@ -1399,8 +1392,6 @@ def render_batch_process():
                     result = response.json()
                     st.success(f"✅ Batch job created! Job ID: {result['job_id']}")
                     st.info(f"📊 Total images: {result['total_images']} | Batch size: {result['batch_size']}")
-                    if use_gemini:
-                        st.success("🤖 Using Gemini AI for enhancement")
                     st.session_state.refresh_batch_jobs = True
                 else:
                     st.error(f"Error: {response.text}")
