@@ -4,6 +4,8 @@ AWS Bedrock Unified Image Service
 Supports multiple AI models with a unified interface.
 Just change BEDROCK_*_MODEL env vars to switch models - no code changes!
 
+IMPORTANT: Bedrock is in us-east-1 region (separate from S3 in ap-south-1)
+
 Models supported:
 - Amazon Nova Canvas (BG removal, inpainting, outpainting)
 - Stability AI Image Services (upscaling: fast, conservative, creative)
@@ -97,6 +99,15 @@ IMAGE_GENERATION_MODELS = {
     "amazon.nova-canvas-v1:0",
     "amazon.titan-image-generator-v2:0",
     "amazon.titan-image-generator-v1",
+    "stability.sd3-5-large-v1:0",
+    "us.stability.sd3-5-large-v1:0",  # Inference profile
+    "stability.stable-image-ultra-v1:0",
+    "stability.stable-image-core-v1:0",
+    "stability.stable-diffusion-xl-v1",
+    "stability.stable-conservative-upscale-v1:0",
+    "us.stability.stable-conservative-upscale-v1:0",  # Inference profile
+    "us.stability.stable-image-conservative-upscale-v1:0", # Inference profile
+    "us.stability.stable-image-remove-background-v1:0",
 }
 
 TEXT_UNDERSTANDING_MODELS = {
@@ -104,6 +115,18 @@ TEXT_UNDERSTANDING_MODELS = {
     "amazon.nova-lite-v1:0",
     "amazon.nova-2-lite-v1:0",
     "amazon.nova-micro-v1:0",
+}
+
+# Model ID mapping: friendly name -> actual inference profile ID
+MODEL_ID_MAPPING = {
+    # Stability upscale models require inference profiles
+    "stability.stable-conservative-upscale-v1:0": "us.stability.stable-conservative-upscale-v1:0",
+    "stability.stable-creative-upscale-v1:0": "us.stability.stable-creative-upscale-v1:0",
+    "stability.stable-fast-upscale-v1:0": "us.stability.stable-fast-upscale-v1:0",
+    # Stability image manipulation models
+    "stability.stable-image-remove-background-v1:0": "us.stability.stable-image-remove-background-v1:0",
+    "stability.stable-image-inpaint-v1:0": "us.stability.stable-image-inpaint-v1:0",
+    "stability.stable-outpaint-v1:0": "us.stability.stable-outpaint-v1:0",
 }
 
 AVAILABLE_MODELS: Dict[str, ModelConfig] = {
@@ -169,13 +192,63 @@ AVAILABLE_MODELS: Dict[str, ModelConfig] = {
         },
         max_input_size=1408,
     ),
+    # Stability AI Models (Available in us-east-1)
+    "stability.sd3-5-large-v1:0": ModelConfig(
+        model_id="us.stability.sd3-5-large-v1:0",  # Use inference profile
+        provider=ModelProvider.STABILITY_AI,
+        supported_operations=[
+            Operation.TEXT_TO_IMAGE, Operation.IMAGE_VARIATION, Operation.LIGHTING_FIX,
+        ],
+        cost_per_operation={
+            "text_to_image": 0.065, "image_variation": 0.065, "lighting_fix": 0.065,
+        },
+        max_input_size=1024,
+        max_output_size=2048,
+    ),
+    "stability.stable-conservative-upscale-v1:0": ModelConfig(
+        model_id="us.stability.stable-conservative-upscale-v1:0",  # Use inference profile
+        provider=ModelProvider.STABILITY_SERVICES,
+        supported_operations=[
+            Operation.UPSCALE_CONSERVATIVE,
+        ],
+        cost_per_operation={
+            "upscale_conservative": 0.04,
+        },
+        max_input_size=1024,
+        max_output_size=4096,
+    ),
+    "stability.stable-creative-upscale-v1:0": ModelConfig(
+        model_id="us.stability.stable-creative-upscale-v1:0",
+        provider=ModelProvider.STABILITY_SERVICES,
+        supported_operations=[Operation.UPSCALE_CREATIVE],
+        cost_per_operation={"upscale_creative": 0.04},
+        max_input_size=1024,
+        max_output_size=4096,
+    ),
+    "stability.stable-fast-upscale-v1:0": ModelConfig(
+        model_id="us.stability.stable-fast-upscale-v1:0",
+        provider=ModelProvider.STABILITY_SERVICES,
+        supported_operations=[Operation.UPSCALE_FAST],
+        cost_per_operation={"upscale_fast": 0.02},
+        max_input_size=1024,
+        max_output_size=4096,
+    ),
+    # Stability Background Removal
+    "stability.stable-image-remove-background-v1:0": ModelConfig(
+        model_id="us.stability.stable-image-remove-background-v1:0",
+        provider=ModelProvider.STABILITY_SERVICES,
+        supported_operations=[Operation.BACKGROUND_REMOVAL],
+        cost_per_operation={"background_removal": 0.04},
+        max_input_size=1024,
+        max_output_size=4096,
+    ),
 }
 
 RECOMMENDED_MODELS = {
-    Operation.BACKGROUND_REMOVAL: "amazon.nova-canvas-v1:0",
-    Operation.UPSCALE_FAST: "amazon.nova-canvas-v1:0",
-    Operation.UPSCALE_CONSERVATIVE: "amazon.nova-canvas-v1:0",
-    Operation.UPSCALE_CREATIVE: "amazon.nova-canvas-v1:0",
+    Operation.BACKGROUND_REMOVAL: "stability.stable-image-remove-background-v1:0",
+    Operation.UPSCALE_FAST: "stability.stable-fast-upscale-v1:0",
+    Operation.UPSCALE_CONSERVATIVE: "stability.stable-conservative-upscale-v1:0",
+    Operation.UPSCALE_CREATIVE: "stability.stable-creative-upscale-v1:0",
     Operation.LIGHTING_FIX: "amazon.nova-canvas-v1:0",
     Operation.INPAINTING: "amazon.nova-canvas-v1:0",
     Operation.OUTPAINTING: "amazon.nova-canvas-v1:0",
@@ -196,16 +269,36 @@ class RequestFormatter(ABC):
     def parse_response(self, response: Dict[str, Any]) -> Optional[Image.Image]:
         pass
 
+ECOMMERCE_NEGATIVE = (
+    "altered product details, changed text, distorted logo, morphed shape, "
+    "different color, new elements, artistic interpretation, illustration, "
+    "painting, cartoon, cgi, smoothing, blurred texture, jpeg artifacts, "
+    "noise, grain, low resolution"
+)
 
 class NovaCanvasFormatter(RequestFormatter):
     def format_request(self, operation: Operation, params: Dict[str, Any]) -> Dict[str, Any]:
-        base_cfg = {"numberOfImages": 1, "quality": params.get("quality", "standard"), "seed": params.get("seed", 42)}
+        base_cfg = {
+            "numberOfImages": 1, 
+            "quality": params.get("quality", "standard"), 
+            "seed": params.get("seed", 42)
+        }
         
         if operation == Operation.BACKGROUND_REMOVAL:
-            return {"taskType": "BACKGROUND_REMOVAL", "backgroundRemovalParams": {"image": params["image_base64"]}}
+            return {"taskType": "BACKGROUND_REMOVAL", "backgroundRemovalParams": {"images": params["image_base64"]}}
         
         if operation == Operation.INPAINTING:
-            req = {"taskType": "INPAINTING", "inPaintingParams": {"image": params["image_base64"], "text": params.get("prompt", "clean product")}, "imageGenerationConfig": base_cfg}
+            # OPTIMIZED: Focus on texture and blending, strictly forbidding new objects
+            prompt = params.get("prompt", "high resolution texture, seamless surface blend, professional photo retouching, maintain lighting consistency")
+            req = {
+                "taskType": "INPAINTING", 
+                "inPaintingParams": {
+                    "images": params["image_base64"], 
+                    "text": prompt,
+                    "negativeText": ECOMMERCE_NEGATIVE
+                }, 
+                "imageGenerationConfig": base_cfg
+            }
             if "mask_base64" in params:
                 req["inPaintingParams"]["maskImage"] = params["mask_base64"]
             elif "mask_prompt" in params:
@@ -213,16 +306,44 @@ class NovaCanvasFormatter(RequestFormatter):
             return req
         
         if operation == Operation.OUTPAINTING:
-            return {"taskType": "OUTPAINTING", "outPaintingParams": {"image": params["image_base64"], "text": params.get("prompt", "seamless extension"), "maskImage": params.get("mask_base64"), "outPaintingMode": params.get("mode", "DEFAULT")}, "imageGenerationConfig": base_cfg}
+            # OPTIMIZED: Ensure the extension matches the studio setting, not the world
+            prompt = params.get("prompt", "professional studio photography background, soft commercial lighting, seamless extension, neutral environment")
+            return {
+                "taskType": "OUTPAINTING", 
+                "outPaintingParams": {
+                    "images": params["image_base64"], 
+                    "text": prompt, 
+                    "maskImage": params.get("mask_base64"), 
+                    "outPaintingMode": params.get("mode", "DEFAULT"),
+                    "negativeText": "cluttered, busy, random objects, people, animals, bright colors"
+                }, 
+                "imageGenerationConfig": base_cfg
+            }
         
         if operation == Operation.TEXT_TO_IMAGE:
-            return {"taskType": "TEXT_IMAGE", "textToImageParams": {"text": params.get("prompt", "professional product photo"), "negativeText": params.get("negative_prompt", "blur, noise")}, "imageGenerationConfig": {**base_cfg, "width": params.get("width", 1024), "height": params.get("height", 1024), "cfgScale": params.get("cfg_scale", 6.5)}}
+            # Unlikely to be used for enhancement, but kept for completeness
+            return {"taskType": "TEXT_IMAGE", "textToImageParams": {"text": params.get("prompt", "professional product photo"), "negativeText": params.get("negative_prompt", ECOMMERCE_NEGATIVE)}, "imageGenerationConfig": {**base_cfg, "width": params.get("width", 1024), "height": params.get("height", 1024), "cfgScale": params.get("cfg_scale", 7.0)}}
         
         if operation in [Operation.IMAGE_VARIATION, Operation.LIGHTING_FIX]:
-            prompt = params.get("prompt", "high quality product")
+            # CRITICAL OPTIMIZATION:
             if operation == Operation.LIGHTING_FIX:
-                prompt = "professional studio lighting, perfect exposure, " + prompt
-            return {"taskType": "IMAGE_VARIATION", "imageVariationParams": {"image": params["image_base64"], "text": prompt, "negativeText": params.get("negative_prompt", "blur, noise"), "similarityStrength": params.get("similarity", 0.7)}, "imageGenerationConfig": base_cfg}
+                # Prompt focuses purely on "photographic properties", not "content"
+                prompt = params.get("prompt", "professional studio lighting, balanced exposure, neutral white balance, 8k resolution, crisp details, natural dynamic range")
+                similarity = params.get("similarity", 0.99) # Increased to 0.99 for lighting only
+            else:
+                prompt = params.get("prompt", "super resolution, 4k clarity, sharp focus, defined edges, rich texture, macro photography details")
+                similarity = params.get("similarity", 0.96) 
+            
+            return {
+                "taskType": "IMAGE_VARIATION",
+                "imageVariationParams": {
+                    "images": [params["image_base64"]],
+                    "text": prompt,
+                    "negativeText": ECOMMERCE_NEGATIVE,
+                    "similarityStrength": similarity
+                },
+                "imageGenerationConfig": base_cfg
+            }
         
         raise ValueError(f"Unsupported: {operation}")
     
@@ -236,15 +357,36 @@ class StabilityServicesFormatter(RequestFormatter):
     def format_request(self, operation: Operation, params: Dict[str, Any]) -> Dict[str, Any]:
         if operation == Operation.UPSCALE_FAST:
             return {"image": params["image_base64"], "output_format": "png"}
+        
         if operation == Operation.UPSCALE_CONSERVATIVE:
-            return {"image": params["image_base64"], "prompt": params.get("prompt", "high quality"), "creativity": params.get("creativity", 0.35), "output_format": "png", "seed": params.get("seed", 0)}
+            # OPTIMIZED: Lowered creativity to 0.2 and focused prompt on "fidelity"
+            return {
+                "image": params["image_base64"], 
+                "prompt": params.get("prompt", "sharp focus, high fidelity, 4k texture, authentic details, no artifacts"), 
+                "negative_prompt": ECOMMERCE_NEGATIVE,
+                "creativity": params.get("creativity", 0.20), # Keep this low to prevent hallucination
+                "output_format": "png", 
+                "seed": params.get("seed", 0)
+            }
+            
         if operation == Operation.UPSCALE_CREATIVE:
-            return {"image": params["image_base64"], "prompt": params.get("prompt", "sharp details"), "creativity": params.get("creativity", 0.3), "negative_prompt": params.get("negative_prompt", "blur"), "output_format": "png", "seed": params.get("seed", 0)}
+            # Even for "creative", we want to constrain it to the product
+            return {
+                "image": params["image_base64"], 
+                "prompt": params.get("prompt", "professional product photography, highly detailed, sharp edges, studio quality"), 
+                "creativity": params.get("creativity", 0.25), # Lowered from 0.3
+                "negative_prompt": params.get("negative_prompt", ECOMMERCE_NEGATIVE), 
+                "output_format": "png", 
+                "seed": params.get("seed", 0)
+            }
+            
         if operation == Operation.BACKGROUND_REMOVAL:
             return {"image": params["image_base64"], "output_format": "png"}
         raise ValueError(f"Unsupported: {operation}")
     
     def parse_response(self, response: Dict[str, Any]) -> Optional[Image.Image]:
+        if "images" in response and response["images"]:
+            return Image.open(io.BytesIO(base64.b64decode(response["images"][0])))
         if "image" in response:
             return Image.open(io.BytesIO(base64.b64decode(response["image"])))
         return None
@@ -253,12 +395,26 @@ class StabilityServicesFormatter(RequestFormatter):
 class StableDiffusionFormatter(RequestFormatter):
     def format_request(self, operation: Operation, params: Dict[str, Any]) -> Dict[str, Any]:
         if operation == Operation.TEXT_TO_IMAGE:
-            return {"prompt": params.get("prompt", "professional product"), "negative_prompt": params.get("negative_prompt", "blur"), "seed": params.get("seed", 0), "output_format": "png"}
+            return {"prompt": params.get("prompt", "professional product"), "negative_prompt": params.get("negative_prompt", ECOMMERCE_NEGATIVE), "seed": params.get("seed", 0), "output_format": "png"}
+        
         if operation in [Operation.IMAGE_VARIATION, Operation.LIGHTING_FIX]:
-            prompt = params.get("prompt", "high quality")
+            # OPTIMIZED: Using very precise technical terms
             if operation == Operation.LIGHTING_FIX:
-                prompt = "professional lighting, " + prompt
-            return {"prompt": prompt, "image": params["image_base64"], "strength": params.get("strength", 0.7), "negative_prompt": params.get("negative_prompt", "blur"), "seed": params.get("seed", 0), "output_format": "png"}
+                prompt = params.get("prompt", "balanced exposure, soft shadows, neutral color grading, professional studio lighting, 8k")
+                # Strength represents "how much to change". 0.15 is safe for lighting.
+                strength = params.get("strength", 0.15) 
+            else:
+                prompt = params.get("prompt", "sharp focus, unsharp mask, high definition, detailed texture, de-blur")
+                strength = params.get("strength", 0.25) 
+            
+            return {
+                "prompt": prompt,
+                "image": params["image_base64"],
+                "strength": strength,
+                "negative_prompt": params.get("negative_prompt", ECOMMERCE_NEGATIVE),
+                "seed": params.get("seed", 0),
+                "output_format": "png"
+            }
         raise ValueError(f"Unsupported: {operation}")
     
     def parse_response(self, response: Dict[str, Any]) -> Optional[Image.Image]:
@@ -276,16 +432,43 @@ class TitanImageFormatter(RequestFormatter):
             base_cfg["height"] = params["height"]
         
         if operation == Operation.BACKGROUND_REMOVAL:
-            return {"taskType": "BACKGROUND_REMOVAL", "backgroundRemovalParams": {"image": params["image_base64"]}}
+            return {"taskType": "BACKGROUND_REMOVAL", "backgroundRemovalParams": {"images": params["image_base64"]}}
+            
         if operation == Operation.TEXT_TO_IMAGE:
-            return {"taskType": "TEXT_IMAGE", "textToImageParams": {"text": params.get("prompt", "product"), "negativeText": params.get("negative_prompt", "blur")}, "imageGenerationConfig": base_cfg}
+            return {"taskType": "TEXT_IMAGE", "textToImageParams": {"text": params.get("prompt", "product"), "negativeText": params.get("negative_prompt", ECOMMERCE_NEGATIVE)}, "imageGenerationConfig": base_cfg}
+            
         if operation in [Operation.IMAGE_VARIATION, Operation.LIGHTING_FIX]:
-            prompt = params.get("prompt", "high quality")
             if operation == Operation.LIGHTING_FIX:
-                prompt = "professional lighting, " + prompt
-            return {"taskType": "IMAGE_VARIATION", "imageVariationParams": {"text": prompt, "negativeText": params.get("negative_prompt", "blur"), "images": [params["image_base64"]], "similarityStrength": params.get("similarity", 0.7)}, "imageGenerationConfig": base_cfg}
+                prompt = params.get("prompt", "photorealistic, perfectly balanced exposure, studio lighting, color corrected, high dynamic range")
+                similarity = params.get("similarity", 0.99) # Extremely high to prevent shape changes
+            else:
+                prompt = params.get("prompt", "ultra-sharp, 4k detail, clear texture, noise reduction, focus enhancement")
+                similarity = params.get("similarity", 0.96)
+            
+            return {
+                "taskType": "IMAGE_VARIATION",
+                "imageVariationParams": {
+                    "text": prompt,
+                    "negativeText": params.get("negative_prompt", ECOMMERCE_NEGATIVE),
+                    "images": [params["image_base64"]],
+                    "similarityStrength": similarity
+                },
+                "imageGenerationConfig": base_cfg
+            }
+            
         if operation == Operation.INPAINTING:
-            return {"taskType": "INPAINTING", "inPaintingParams": {"text": params.get("prompt", "clean"), "negativeText": params.get("negative_prompt", ""), "image": params["image_base64"], "maskImage": params.get("mask_base64"), "maskPrompt": params.get("mask_prompt")}, "imageGenerationConfig": base_cfg}
+            prompt = params.get("prompt", "restore texture, seamless repair, high quality match")
+            return {
+                "taskType": "INPAINTING",
+                "inPaintingParams": {
+                    "text": prompt,
+                    "negativeText": params.get("negative_prompt", ECOMMERCE_NEGATIVE),
+                    "images": params["image_base64"],
+                    "maskImage": params.get("mask_base64"),
+                    "maskPrompt": params.get("mask_prompt")
+                },
+                "imageGenerationConfig": base_cfg
+            }
         raise ValueError(f"Unsupported: {operation}")
     
     def parse_response(self, response: Dict[str, Any]) -> Optional[Image.Image]:
@@ -309,6 +492,8 @@ class BedrockService:
     """
     Unified Bedrock Image Service
     
+    IMPORTANT: Bedrock is in us-east-1 region (separate from S3 in ap-south-1)
+    
     Just set these env vars to switch models:
       BEDROCK_BG_MODEL=amazon.nova-canvas-v1:0
       BEDROCK_UPSCALE_MODEL=stability.si.conservative-upscale-v2:0
@@ -317,37 +502,50 @@ class BedrockService:
     
     def __init__(self, default_region: str = None):
         self.config = get_config()
-        self.region = default_region or self.config.storage.s3_region or "us-east-1"
+        # IMPORTANT: Bedrock is always in us-east-1
+        self.region = self.config.hybrid.bedrock_region or "us-east-1"
         self._client = None
         self._daily_cost = 0.0
         self._call_count = 0
         self._last_reset = datetime.now().date()
         self._call_history: List[Dict] = []
         
-        # Load model preferences from env
-        self.default_bg_model = os.getenv("BEDROCK_BG_MODEL", "amazon.nova-canvas-v1:0")
-        self.default_upscale_model = os.getenv("BEDROCK_UPSCALE_MODEL", "amazon.nova-canvas-v1:0")
+        # Load model preferences from env (using available models in us-east-1)
+        self.default_bg_model = os.getenv("BEDROCK_BG_MODEL", "stability.stable-image-remove-background-v1:0")
+        self.default_upscale_model = os.getenv("BEDROCK_UPSCALE_MODEL", "stability.stable-conservative-upscale-v1:0")
         self.default_lighting_model = os.getenv("BEDROCK_LIGHTING_MODEL", "amazon.nova-canvas-v1:0")
         self.default_variation_model = os.getenv("BEDROCK_VARIATION_MODEL", "amazon.nova-canvas-v1:0")
         
         logger.info("=" * 60)
         logger.info("🤖 BedrockService Initialized (Multi-Model)")
         logger.info(f"   Region: {self.region}")
-        logger.info(f"   BG: {self.default_bg_model}")
-        logger.info(f"   Upscale: {self.default_upscale_model}")
-        logger.info(f"   Lighting: {self.default_lighting_model}")
+        logger.info(f"   Enabled: {self.config.hybrid.enable_bedrock}")
+        logger.info(f"   BG Model: {self.default_bg_model}")
+        logger.info(f"   Upscale Model: {self.default_upscale_model}")
+        logger.info(f"   Lighting Model: {self.default_lighting_model}")
+        logger.info(f"   Max Daily Cost: ${self.config.hybrid.max_daily_cost:.2f}")
         logger.info("=" * 60)
     
     @property
     def client(self):
         if self._client is None:
             try:
-                ak, sk = os.getenv("AWS_ACCESS_KEY_ID"), os.getenv("AWS_SECRET_ACCESS_KEY")
+                ak = os.getenv("AWS_ACCESS_KEY_ID")
+                sk = os.getenv("AWS_SECRET_ACCESS_KEY")
+                
                 if ak and sk:
-                    self._client = boto3.client('bedrock-runtime', region_name=self.region, aws_access_key_id=ak, aws_secret_access_key=sk)
+                    self._client = boto3.client(
+                        'bedrock-runtime', 
+                        region_name=self.region, 
+                        aws_access_key_id=ak, 
+                        aws_secret_access_key=sk
+                    )
+                    logger.info(f"✅ Bedrock client initialized with credentials (region: {self.region})")
                 else:
                     self._client = boto3.client('bedrock-runtime', region_name=self.region)
-                logger.info("✅ Bedrock client initialized")
+                    logger.info(f"✅ Bedrock client initialized with default credentials (region: {self.region})")
+            except NoCredentialsError:
+                logger.error("❌ AWS credentials not found for Bedrock")
             except Exception as e:
                 logger.error(f"❌ Bedrock init failed: {e}")
         return self._client
@@ -388,8 +586,20 @@ class BedrockService:
     def is_available(self) -> bool:
         return self.config.hybrid.enable_bedrock and self.client is not None
     
-    def get_model_config(self, model_id: str):
-        return AVAILABLE_MODELS.get(model_id)
+    def get_model_config(self, model_id: str) -> Optional[ModelConfig]:
+        """Get model config - checks original ID, mapped ID, and reverse lookup"""
+        # First check if it's directly in AVAILABLE_MODELS
+        if model_id in AVAILABLE_MODELS:
+            return AVAILABLE_MODELS[model_id]
+        
+        # Check if this is an inference profile ID - do reverse lookup
+        for friendly_name, inference_profile in MODEL_ID_MAPPING.items():
+            if model_id == inference_profile:
+                return AVAILABLE_MODELS.get(friendly_name)
+        
+        # Then check if we need to map it forward
+        actual_model_id = MODEL_ID_MAPPING.get(model_id, model_id)
+        return AVAILABLE_MODELS.get(actual_model_id)
     
     def list_available_models(self) -> List[str]:
         return list(AVAILABLE_MODELS.keys())
@@ -406,10 +616,23 @@ class BedrockService:
             model_id = self.get_recommended_model(operation)
             logger.info(f"🤖 Auto-selected model: {model_id} for {operation.value}")
         
+        # Map friendly name to actual model ID
+        actual_model_id = model_id
+        # Check forward mapping (friendly → inference profile)
+        if model_id in MODEL_ID_MAPPING:
+            actual_model_id = MODEL_ID_MAPPING[model_id]
+            logger.info(f"📝 Mapped {model_id} → {actual_model_id}")
+        else:
+            # Check if already an inference profile - use as-is
+            for friendly, profile in MODEL_ID_MAPPING.items():
+                if model_id == profile:
+                    logger.info(f"📝 Using inference profile directly: {model_id}")
+                    break
+        
         # CRITICAL VALIDATION: Check if model can generate images
-        if model_id in TEXT_UNDERSTANDING_MODELS:
+        if actual_model_id in TEXT_UNDERSTANDING_MODELS:
             error_msg = (
-                f"❌ INVALID MODEL: {model_id} is a TEXT UNDERSTANDING model that CANNOT generate/modify images.\n"
+                f"❌ INVALID MODEL: {actual_model_id} is a TEXT UNDERSTANDING model that CANNOT generate/modify images.\n"
                 f"   It can only ANALYZE images. For image generation/manipulation, you need:\n"
                 f"   - amazon.nova-canvas-v1:0 (recommended)\n"
                 f"   - amazon.titan-image-generator-v2:0\n"
@@ -417,7 +640,7 @@ class BedrockService:
                 f"   Falling back to LOCAL processing."
             )
             logger.error(error_msg)
-            return BedrockCallResult(success=False, operation=operation.value, model_id=model_id, error="Model cannot generate images")
+            return BedrockCallResult(success=False, operation=operation.value, model_id=actual_model_id, error="Model cannot generate images")
         
         cfg = self.get_model_config(model_id)
         if not cfg:
@@ -425,14 +648,14 @@ class BedrockService:
             return BedrockCallResult(success=False, operation=operation.value, error=f"Unknown model: {model_id}")
         if operation not in cfg.supported_operations:
             logger.error(f"❌ {operation.value} not supported by {model_id}")
-            return BedrockCallResult(success=False, operation=operation.value, model_id=model_id, error=f"{operation.value} not supported by {model_id}")
+            return BedrockCallResult(success=False, operation=operation.value, model_id=actual_model_id, error=f"{operation.value} not supported by {model_id}")
         
         logger.info("=" * 60)
         logger.info(f"🚀 BEDROCK MODEL CALL")
         logger.info(f"   Operation: {operation.value}")
-        logger.info(f"   Model: {model_id}")
+        logger.info(f"   Model: {actual_model_id}")
         logger.info(f"   Provider: {cfg.provider.value}")
-        logger.info(f"   Model Type: {'IMAGE GENERATION' if model_id in IMAGE_GENERATION_MODELS else 'TEXT UNDERSTANDING'}")
+        logger.info(f"   Model Type: {'IMAGE GENERATION' if actual_model_id in IMAGE_GENERATION_MODELS else 'TEXT UNDERSTANDING'}")
         logger.info(f"   Estimated Cost: ${cfg.cost_per_operation.get(operation.value, 0.02):.4f}")
         if image:
             logger.info(f"   Input Image: {image.size[0]}x{image.size[1]} ({image.mode})")
@@ -455,42 +678,52 @@ class BedrockService:
             req = fmt.format_request(operation, params)
             
             logger.info(f"📤 Sending request to Bedrock...")
-            resp = self.client.invoke_model(modelId=model_id, body=json.dumps(req), accept="application/json", contentType="application/json")
+            resp = self.client.invoke_model(modelId=actual_model_id, body=json.dumps(req), accept="application/json", contentType="application/json")
             body = json.loads(resp.get("body").read())
+            logger.info(f"📦 Bedrock Response Keys: {list(body.keys())}")
+            if "status" in body:
+                 logger.info(f"📦 Status: {body.get('status')}")
+            
             img = fmt.parse_response(body)
             
             if img:
                 lat = int((time.time() - start) * 1000)
                 cost = cfg.cost_per_operation.get(operation.value, 0.02)
-                self._track_cost(model_id, operation.value, cost)
+                self._track_cost(actual_model_id, operation.value, cost)
                 logger.info(f"✅ SUCCESS")
                 logger.info(f"   Output Image: {img.size[0]}x{img.size[1]} ({img.mode})")
                 logger.info(f"   Latency: {lat}ms")
                 logger.info(f"   Cost: ${cost:.4f}")
                 logger.info(f"💰 Running Total: ${self._daily_cost:.4f} ({self._call_count} calls today)")
                 logger.info("=" * 60)
-                return BedrockCallResult(success=True, image=img, operation=operation.value, model_id=model_id, latency_ms=lat, estimated_cost=cost)
+                return BedrockCallResult(success=True, image=img, operation=operation.value, model_id=actual_model_id, latency_ms=lat, estimated_cost=cost)
             raise ValueError("No image in response")
         except ClientError as e:
             err = e.response.get("Error", {})
             logger.error(f"❌ Bedrock API Error: {err.get('Code')}: {err.get('Message')}")
             logger.error("=" * 60)
-            return BedrockCallResult(success=False, operation=operation.value, model_id=model_id, latency_ms=int((time.time()-start)*1000), error=str(e))
+            return BedrockCallResult(success=False, operation=operation.value, model_id=actual_model_id, latency_ms=int((time.time()-start)*1000), error=str(e))
         except Exception as e:
             logger.error(f"❌ Error: {e}")
             logger.error("=" * 60)
-            return BedrockCallResult(success=False, operation=operation.value, model_id=model_id, latency_ms=int((time.time()-start)*1000), error=str(e))
+            return BedrockCallResult(success=False, operation=operation.value, model_id=actual_model_id, latency_ms=int((time.time()-start)*1000), error=str(e))
     
     # Convenience methods
     def remove_background(self, image: Image.Image, model_id: str = None, **kw) -> BedrockCallResult:
         return self.invoke(Operation.BACKGROUND_REMOVAL, image, model_id or self.default_bg_model, kw)
     
     def upscale_image(self, image: Image.Image, mode: str = "conservative", model_id: str = None, **kw) -> BedrockCallResult:
-        """Upscale image using image variation with upscaling prompt"""
-        # Nova models don't have dedicated upscale - use image variation with upscale prompt
+        """Upscale image - uses dedicated upscale model if available, otherwise image variation"""
+        model_id = model_id or self.default_upscale_model
+        
+        # Check if model supports dedicated upscaling
+        if "upscale" in model_id.lower():
+            return self.invoke(Operation.UPSCALE_CONSERVATIVE, image, model_id, kw)
+        
+        # Fallback to image variation with upscaling prompt
         kw["prompt"] = kw.get("prompt", "ultra high resolution, sharp details, 4K quality")
-        kw["similarity"] = kw.get("similarity", 0.85)  # High similarity to preserve original
-        return self.invoke(Operation.IMAGE_VARIATION, image, model_id or self.default_upscale_model, kw)
+        kw["similarity"] = kw.get("similarity", 0.85)
+        return self.invoke(Operation.IMAGE_VARIATION, image, model_id, kw)
     
     def fix_lighting(self, image: Image.Image, model_id: str = None, prompt: str = None, **kw) -> BedrockCallResult:
         kw["prompt"] = prompt or "professional studio lighting, perfect exposure"
@@ -507,7 +740,7 @@ class BedrockService:
             kw["mask_base64"] = self._image_to_base64(mask_image)
         elif mask_prompt:
             kw["mask_prompt"] = mask_prompt
-        return self.invoke(Operation.INPAINTING, image, model_id or "amazon.nova-pro-v1:0", kw)
+        return self.invoke(Operation.INPAINTING, image, model_id or "amazon.nova-canvas-v1:0", kw)
     
     def get_usage_stats(self) -> Dict[str, Any]:
         self._reset_daily_cost_if_needed()

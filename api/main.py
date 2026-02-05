@@ -25,11 +25,22 @@ from src.logging_config import setup_logging
 from src.gemini_service import GeminiService
 from src.s3_service import S3Service
 
+import boto3
+from urllib.parse import urlparse
+from botocore.exceptions import ClientError
+
 # Initialize logging
 setup_logging(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 config = get_config()
 
+class CDNUpdateResponse(BaseModel):
+    success: bool
+    bucket: str
+    key: str
+    url: str
+    cache_control: str
+    message: str
 
 # Pydantic models for API
 class EnhanceUrlRequest(BaseModel):
@@ -135,6 +146,7 @@ class StatsResponse(BaseModel):
 # Initialize services
 enhancer = ImageEnhancer()
 assessor = QualityAssessor()
+s3_service = None
 kafka_producer = None
 redis_client = None
 
@@ -145,16 +157,35 @@ async def lifespan(app: FastAPI):
     global kafka_producer, redis_client
     
     # Startup
-    logger.info("Starting Image Enhancement API...")
+    logger.info("=" * 60)
+    logger.info("🚀 Starting Image Enhancement API...")
+    logger.info("=" * 60)
+    
     init_db()
+    logger.info("✅ Database initialized")
+    
+    # Initialize S3 Service
+    global s3_service
+    try:
+        s3_service = S3Service(
+            bucket=config.storage.s3_bucket,
+            region=config.storage.s3_region,
+            endpoint_url=config.storage.s3_endpoint if config.storage.s3_endpoint else None,
+            access_key=config.storage.s3_access_key,
+            secret_key=config.storage.s3_secret_key
+        )
+        if s3_service.is_available():
+            logger.info(f"✅ S3 Storage available: {config.storage.s3_bucket}")
+    except Exception as e:
+        logger.warning(f"⚠️ S3 Storage validation failed: {e}")
     
     # Initialize Kafka producer
     if config.enable_kafka_pipeline:
         try:
             kafka_producer = KafkaProducerService()
-            logger.info("Kafka producer initialized")
+            logger.info("✅ Kafka producer initialized")
         except Exception as e:
-            logger.warning(f"Kafka not available: {e}")
+            logger.warning(f"⚠️ Kafka not available: {e}")
     
     # Initialize Redis
     try:
@@ -166,10 +197,14 @@ async def lifespan(app: FastAPI):
             decode_responses=True
         )
         redis_client.ping()
-        logger.info("Redis connected")
+        logger.info("✅ Redis connected")
     except Exception as e:
-        logger.warning(f"Redis not available: {e}")
+        logger.warning(f"⚠️ Redis not available: {e}")
         redis_client = None
+    
+    logger.info("=" * 60)
+    logger.info("🎉 API Ready!")
+    logger.info("=" * 60)
     
     yield
     
@@ -268,8 +303,17 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "kafka": kafka_producer is not None,
-        "redis": redis_client is not None if redis_client else False
+        "services": {
+            "kafka": kafka_producer is not None,
+            "redis": redis_client is not None if redis_client else False,
+            "s3": s3_service.is_available() if s3_service else False,
+            "bedrock": config.hybrid.enable_bedrock
+        },
+        "config": {
+            "s3_bucket": config.storage.s3_bucket,
+            "s3_region": config.storage.s3_region,
+            "bedrock_region": config.hybrid.bedrock_region
+        }
     }
 
 
@@ -289,6 +333,14 @@ async def enhance_upload(
     """
     start_time = time.time()
     image_id = str(uuid.uuid4())
+    
+    logger.info("=" * 80)
+    logger.info(f"📥 API REQUEST | enhance/upload | ID: {image_id}")
+    logger.info(f"   Filename: {file.filename}")
+    logger.info(f"   Mode: {mode.value}")
+    logger.info(f"   Target Size: {target_size_kb}KB")
+    logger.info(f"   Format: {output_format}")
+    logger.info("-" * 80)
     db = None
     
     # Validate file type
@@ -299,18 +351,10 @@ async def enhance_upload(
         # Read uploaded file
         content = await file.read()
         original_size = len(content)
+        logger.info(f"   📦 Original size: {original_size/1024:.1f}KB")
         mime_type = file.content_type
         
         logger.info(f"[UPLOAD] File received: {file.filename}, size: {original_size} bytes")
-        
-        # Initialize S3 and database
-        s3_service = S3Service(
-            bucket=config.storage.s3_bucket,
-            region=config.storage.s3_region,
-            endpoint_url=config.storage.s3_endpoint if config.storage.s3_endpoint else None,
-            access_key=config.storage.s3_access_key,
-            secret_key=config.storage.s3_secret_key
-        )
         
         db = get_db()
         image_repo = ImageRepository(db)
@@ -332,8 +376,10 @@ async def enhance_upload(
         
         # Assess quality before
         quality_before = assessor.quick_assess(content)
+        logger.info(f"   📊 Original quality - Blur: {quality_before.get('blur_score', 0):.1f}")
         
         # Enhance image
+        logger.info(f"   ⚙️ Enhancing...")
         result = enhancer.enhance(
             content,
             mode=mode,
@@ -344,10 +390,13 @@ async def enhance_upload(
         if not result.success:
             raise HTTPException(500, f"Enhancement failed: {result.error}")
         
-        # Assess quality after
+        # Get enhanced bytes
         enhanced_bytes = enhancer.get_enhanced_bytes(result, output_format, target_size_kb)
-        quality_after = assessor.quick_assess(enhanced_bytes)
+        logger.info(f"   ✅ Enhanced size: {len(enhanced_bytes)/1024:.1f}KB")
         
+        # Assess quality after
+        quality_after = assessor.quick_assess(enhanced_bytes)
+        logger.info(f"   📊 Enhanced quality - Blur: {quality_after.get('blur_score', 0):.1f}")
         # Upload enhanced image to S3
         enhanced_key = f"uploads/enhanced/{image_id}_{file.filename}"
         enhanced_s3_url = s3_service.upload_image(
@@ -363,6 +412,11 @@ async def enhance_upload(
         )
         enhanced_https_url = s3_service.get_https_url(enhanced_key, cloudfront_domain=None)
         logger.info(f"[UPLOAD] Enhanced uploaded to S3: {enhanced_key}")
+
+        # Calculate quality improvement
+        blur_before = quality_before.get('blur_score', 0)
+        blur_after = quality_after.get('blur_score', 0)
+        improvement = ((blur_after - blur_before) / max(blur_before, 1)) * 100 if blur_before else None
         
         # Save to database with S3 URLs
         product_image = image_repo.create(
@@ -421,6 +475,13 @@ async def enhance_upload(
         logger.info(f"[UPLOAD] Enhancement history created: {history.id}")
         
         processing_time = int((time.time() - start_time) * 1000)
+        
+        logger.info("=" * 80)
+        logger.info(f"✅ ENHANCEMENT COMPLETE | ID: {image_id}")
+        logger.info(f"   Total time: {processing_time}ms")
+        logger.info(f"   Size reduction: {result.size_reduction_percent:.1f}%")
+        logger.info(f"   Quality improvement: {improvement:.1f}%" if improvement else "   Quality: N/A")
+        logger.info("=" * 80)
         
         return EnhanceResponse(
             success=True,
@@ -488,8 +549,10 @@ async def enhance_url(request: EnhanceUrlRequest):
         
         # Assess quality before
         quality_before = assessor.quick_assess(content)
+        logger.info(f"   📊 Original quality - Blur: {quality_before.get('blur_score', 0):.1f}")
         
         # Enhance image
+        logger.info(f"   ⚙️ Enhancing...")
         result = enhancer.enhance(
             content,
             mode=request.mode,
@@ -500,24 +563,18 @@ async def enhance_url(request: EnhanceUrlRequest):
         if not result.success:
             raise HTTPException(500, f"Enhancement failed: {result.error}")
         
-        # Get enhanced bytes
+        # Get enhanced bytes - THIS IS CRITICAL: must get bytes from result
         enhanced_bytes = enhancer.get_enhanced_bytes(
             result, 
             request.output_format, 
             request.target_size_kb
         )
+        logger.info(f"   ✅ Enhanced size: {len(enhanced_bytes)/1024:.1f}KB")
         
         # Assess quality after
         quality_after = assessor.quick_assess(enhanced_bytes)
         
-        # Initialize S3 and database
-        s3_service = S3Service(
-            bucket=config.storage.s3_bucket,
-            region=config.storage.s3_region,
-            endpoint_url=config.storage.s3_endpoint if config.storage.s3_endpoint else None,
-            access_key=config.storage.s3_access_key,
-            secret_key=config.storage.s3_secret_key
-        )
+
         
         db = get_db()
         image_repo = ImageRepository(db)
@@ -612,8 +669,14 @@ async def enhance_url(request: EnhanceUrlRequest):
         
         processing_time = int((time.time() - start_time) * 1000)
         
+        logger.info("=" * 80)
+        logger.info(f"✅ ENHANCEMENT COMPLETE | ID: {image_id}")
+        logger.info(f"   Total time: {processing_time}ms")
+        logger.info(f"   Size reduction: {result.size_reduction_percent:.1f}%")
+        logger.info(f"   Quality improvement: {improvement:.1f}%" if improvement else "   Quality: N/A")
+        logger.info("=" * 80)
+        
         return EnhanceResponse(
-            success=True,
             image_id=product_image.id,
             database_id=product_image.id,
             original_url=original_https_url,
@@ -627,6 +690,7 @@ async def enhance_url(request: EnhanceUrlRequest):
             enhancement_mode=request.mode.value
         )
     except HTTPException:
+        logger.error(f"❌ Failed to fetch image: {e}")
         raise
     except Exception as e:
         logger.error(f"[URL-ENHANCE] Enhancement failed: {e}", exc_info=True)
@@ -655,6 +719,12 @@ async def get_enhanced_image(image_id: str):
         if not image:
             raise HTTPException(404, "Image not found")
         
+        # If we have an S3 URL, redirect to it
+        if image.enhanced_image_url:
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url=image.enhanced_image_url)
+        
+        # Fallback to local path
         if not image.enhanced_local_path:
             raise HTTPException(404, "Enhanced image not available")
         
@@ -983,7 +1053,7 @@ async def create_batch_job(
         image_repo = ImageRepository(db)
         for url in request.image_urls:
             image_repo.create(
-                original_url=url,
+                image_url=url,
                 status=ProcessingStatus.QUEUED.value
             )
     finally:
@@ -1071,7 +1141,7 @@ async def import_cloudfront_urls(request: ImportUrlsRequest):
         
         images_data = [
             {
-                "original_url": url,
+                "image_url": url,
                 "cloudfront_url": url,
                 "source_type": request.source_type,
                 "category": request.category,
@@ -1104,10 +1174,10 @@ async def get_statistics():
             total_images=stats['total_images'],
             processed_images=stats['status_counts'].get('completed', 0),
             pending_images=stats['status_counts'].get('pending', 0),
-            avg_quality_score=stats['avg_quality_score'],
-            avg_quality_improvement=stats['avg_quality_improvement'],
-            avg_size_reduction=stats['avg_size_reduction'],
-            quality_distribution=stats['quality_distribution']
+            avg_quality_score=stats.get('avg_quality_score'),
+            avg_quality_improvement=stats.get('avg_quality_improvement'),
+            avg_size_reduction=stats.get('avg_size_reduction'),
+            quality_distribution=stats.get('quality_distribution', {})
         )
     finally:
         db.close()
@@ -1149,3 +1219,94 @@ if __name__ == "__main__":
         port=config.api.port,
         reload=True
     )
+
+@app.post("/api/v1/tools/update-cdn-image", response_model=CDNUpdateResponse)
+async def update_cdn_image(
+    file: UploadFile = File(...),
+    target_url: str = Form(..., description="The full S3/CDN URL to overwrite")
+):
+    """
+    Overwrite an existing S3 image and update Cache-Control headers.
+    Target Bucket: catalystproduction-innew
+    Cache-Control: max-age=120 (2 minutes)
+    """
+    TARGET_BUCKET = config.storage.catalyst_bucket
+    
+    # 1. Parse the Key from the URL
+    try:
+        parsed_url = urlparse(target_url)
+        # Remove the leading slash from the path to get the S3 Key
+        # Ex: /media/public/image.jpg -> media/public/image.jpg
+        object_key = parsed_url.path.lstrip('/')
+        
+        if not object_key:
+            raise HTTPException(400, "Could not extract valid object key from URL")
+            
+        logger.info(f"🔄 CDN Update Request for Key: {object_key}")
+    except Exception as e:
+        raise HTTPException(400, f"Invalid URL format: {str(e)}")
+
+    # 2. Validate File
+    if not file.content_type or not file.content_type.startswith('image/'):
+        raise HTTPException(400, "Invalid file type. Must be an image.")
+
+    try:
+        content = await file.read()
+        aws_access = config.storage.catalyst_s3_access_key
+        aws_secret = config.storage.catalyst_s3_secret_key
+        
+        # 3. Upload with specific Cache-Control
+        # We access the boto3 client directly to pass specific ExtraArgs
+        # If s3_service is initialized, we use its client, otherwise we use config
+        
+        if aws_access and aws_secret and "placeholder" not in aws_access:
+            logger.info("🔑 Using credentials from Config/Env")
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=aws_access,
+                aws_secret_access_key=aws_secret,
+                region_name="ap-south-1"
+            )
+        else:
+            logger.info("🔑 Using Default/CLI credentials")
+            s3_client = boto3.client('s3', region_name="ap-south-1")
+
+        # DEBUG: Verify who we are logged in as
+        try:
+            sts = boto3.client(
+                'sts', 
+                aws_access_key_id=aws_access if aws_access else None,
+                aws_secret_access_key=aws_secret if aws_secret else None
+            )
+            identity = sts.get_caller_identity()
+            logger.info(f"🕵️ Authenticated as: {identity['Arn']}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not verify identity: {e}")
+
+        # 4. Upload
+        s3_client.put_object(
+            Bucket=TARGET_BUCKET,
+            Key=object_key,
+            Body=content,
+            ContentType=file.content_type,
+            CacheControl='max-age=120' 
+            # ACL removed to prevent 403 on buckets with Block Public Access
+        )
+        
+        logger.info(f"✅ Successfully overwrote {object_key} with 2-min cache")
+        
+        return CDNUpdateResponse(
+            success=True,
+            bucket=TARGET_BUCKET,
+            key=object_key,
+            url=target_url,
+            cache_control="max-age=120",
+            message="Image updated successfully. CDN should refresh within 2 minutes."
+        )
+
+    except ClientError as e:
+        logger.error(f"❌ S3 Upload Error: {e}")
+        raise HTTPException(500, f"AWS S3 Error: {str(e)}")
+    except Exception as e:
+        logger.error(f"❌ Update Failed: {e}")
+        raise HTTPException(500, f"Update failed: {str(e)}")

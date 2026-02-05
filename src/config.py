@@ -234,6 +234,9 @@ class StorageConfig:
     s3_endpoint: str = field(default_factory=lambda: os.getenv("S3_ENDPOINT", ""))
     s3_access_key: str = field(default_factory=lambda: os.getenv("AWS_ACCESS_KEY_ID", ""))
     s3_secret_key: str = field(default_factory=lambda: os.getenv("AWS_SECRET_ACCESS_KEY", ""))
+    catalyst_bucket: str = field(default_factory=lambda: os.getenv("CATALYST_BUCKET", ""))
+    catalyst_s3_access_key: str = field(default_factory=lambda: os.getenv("CATALYST_BUCKET_ACCESS_KEY", ""))
+    catalyst_s3_secret_key: str = field(default_factory=lambda: os.getenv("CATALYST_BUCKET_SECRET_KEY", ""))
     
     cloudfront_domain: str = field(
         default_factory=lambda: os.getenv("CLOUDFRONT_DOMAIN", "")
@@ -274,10 +277,17 @@ class HybridConfig:
     
     Controls when to use AI (Bedrock) vs local (OpenCV) processing.
     AI is more expensive but higher quality for complex cases.
+    
+    IMPORTANT: Bedrock is in us-east-1 region!
     """
     # Master toggle for Bedrock
     enable_bedrock: bool = field(
         default_factory=lambda: os.getenv("ENABLE_BEDROCK", "true").lower() == "true"
+    )
+    
+    # Bedrock region (separate from S3 region!)
+    bedrock_region: str = field(
+        default_factory=lambda: os.getenv("BEDROCK_REGION", "us-east-1")
     )
     
     # Cost controls
