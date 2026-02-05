@@ -180,6 +180,14 @@ class ProductImage(Base):
     is_standardized = Column(Boolean, default=False)
     is_high_value = Column(Boolean, default=False)  # Requires human QC
     
+    # Analysis metrics
+    analysis_blur_score = Column(Float, nullable=True)
+    analysis_brightness = Column(Float, nullable=True)
+    analysis_contrast = Column(Float, nullable=True)
+    analysis_noise = Column(Float, nullable=True)
+    analysis_bg_complexity = Column(Float, nullable=True)
+    analysis_metadata = Column(JSON, nullable=True)
+    
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -328,6 +336,26 @@ class ProcessingJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
+    @property
+    def progress_percentage(self) -> float:
+        if self.total_images == 0:
+            return 0.0
+        return round((self.processed_count / self.total_images) * 100, 2)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "job_type": self.job_type,
+            "status": self.status,
+            "product_group_id": self.product_group_id,
+            "sku_id": self.sku_id,
+            "total_images": self.total_images,
+            "processed_count": self.processed_count,
+            "success_count": self.success_count,
+            "failed_count": self.failed_count,
+            "progress_percentage": self.progress_percentage,
+            "avg_quality_improvement": self.avg_quality_improvement,
+        }
 
 class EnhancementHistory(Base):
     """Enhancement History - audit trail of all image enhancements with metadata"""
@@ -409,28 +437,6 @@ class EnhancementHistory(Base):
             "processing_status": self.processing_status,
             "enhancements_applied": self.enhancements_applied,
             "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
-
-
-    @property
-    def progress_percentage(self) -> float:
-        if self.total_images == 0:
-            return 0.0
-        return round((self.processed_count / self.total_images) * 100, 2)
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "job_type": self.job_type,
-            "status": self.status,
-            "product_group_id": self.product_group_id,
-            "sku_id": self.sku_id,
-            "total_images": self.total_images,
-            "processed_count": self.processed_count,
-            "success_count": self.success_count,
-            "failed_count": self.failed_count,
-            "progress_percentage": self.progress_percentage,
-            "avg_quality_improvement": self.avg_quality_improvement,
         }
 
 
@@ -595,9 +601,12 @@ class ProductImageRepository:
             ProductImage.product_group_id == product_group_id
         ).limit(limit).all()
     
-    def get_pending(self, limit: int = 100) -> List[ProductImage]:
+    def get_unprocessed(self, limit: int = 100) -> List[ProductImage]:
+        """Get pending images with valid image_url"""
         return self.db.query(ProductImage).filter(
-            ProductImage.status == ProcessingStatus.PENDING.value
+            ProductImage.status == ProcessingStatus.PENDING.value,
+            ProductImage.image_url.isnot(None),
+            ProductImage.image_url != ''
         ).order_by(ProductImage.created_at).limit(limit).all()
     
     def get_needs_qc_review(self, limit: int = 100) -> List[ProductImage]:
@@ -869,6 +878,10 @@ class EnhancementHistoryRepository:
             self.db.commit()
             self.db.refresh(record)
         return record
+    
+    def get_latest_by_image(self, image_id: str) -> Optional[EnhancementHistory]:
+        """Get the most recent enhancement for an image by image_id (alias for get_latest_enhancement)"""
+        return self.get_latest_enhancement(image_id)
     
     def delete(self, history_id: int) -> bool:
         """Delete an enhancement history record"""

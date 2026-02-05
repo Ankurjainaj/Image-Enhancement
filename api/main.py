@@ -17,7 +17,7 @@ from pydantic import BaseModel, HttpUrl, Field
 import redis
 
 from src.config import get_config, EnhancementMode, ProcessingStatus
-from src.database import init_db, get_db, ImageRepository, JobRepository, ImageRecord, EnhancementHistoryRepository
+from src.database import init_db, get_db, ImageRepository, JobRepository, ImageRecord, EnhancementHistoryRepository, ProcessingJob
 from src.enhancer import ImageEnhancer, EnhancementResult
 from src.quality import QualityAssessor, QualityReport
 from src.kafka_service import KafkaProducerService, ImageJob, create_image_jobs
@@ -50,6 +50,8 @@ class EnhanceUrlRequest(BaseModel):
     target_size_kb: Optional[int] = Field(None, ge=50, le=2000)
     output_format: str = Field("JPEG", pattern="^(JPEG|PNG|WEBP)$")
     return_base64: bool = False
+    sku_id: Optional[str] = None
+    image_id: Optional[str] = None
 
 
 class EnhanceResponse(BaseModel):
@@ -611,27 +613,69 @@ async def enhance_url(request: EnhanceUrlRequest):
         enhanced_https_url = s3_service.get_https_url(enhanced_key, cloudfront_domain=None)
         logger.info(f"[URL-ENHANCE] Enhanced uploaded to S3: {enhanced_key}")
         
-        # Save to database with S3 URLs
-        product_image = image_repo.create(
-            sku_id=f"url_{image_id}",
-            image_url=original_https_url,
-            enhanced_image_url=enhanced_https_url,
-            original_filename=filename,
-            original_width=result.original_dimensions[0],
-            original_height=result.original_dimensions[1],
-            original_size_bytes=original_size,
-            enhanced_width=result.enhanced_dimensions[0],
-            enhanced_height=result.enhanced_dimensions[1],
-            enhanced_size_bytes=len(enhanced_bytes),
-            original_format=mime_type.split('/')[-1].upper(),
-            enhanced_format=request.output_format,
-            status=ProcessingStatus.COMPLETED.value,
-            processing_time_ms=result.processing_time_ms,
-            enhancement_mode=request.mode.value,
-            processed_at=datetime.utcnow(),
-            enhancements_applied=result.enhancements_applied if hasattr(result, 'enhancements_applied') else None
-        )
-        logger.info(f"[URL-ENHANCE] Database record created: {product_image.id}")
+        # Save or update database record
+        if request.image_id:
+            # Update existing record with all fields
+            existing_image = image_repo.get_by_id(request.image_id)
+            if existing_image:
+                # Determine flags from enhancements_applied
+                enhancements = result.enhancements_applied if hasattr(result, 'enhancements_applied') else []
+                bg_removed = 'bg_removal' in enhancements if enhancements else False
+                needs_upscaling = result.enhanced_dimensions[0] > result.original_dimensions[0]
+                
+                image_repo.update_enhanced(
+                    request.image_id,
+                    enhanced_url=enhanced_https_url,
+                    enhanced_width=result.enhanced_dimensions[0],
+                    enhanced_height=result.enhanced_dimensions[1],
+                    enhanced_size_bytes=len(enhanced_bytes),
+                    enhanced_format=request.output_format,
+                    original_width=result.original_dimensions[0],
+                    original_height=result.original_dimensions[1],
+                    original_size_bytes=original_size,
+                    original_format=mime_type.split('/')[-1].upper(),
+                    original_filename=filename,
+                    processing_time_ms=result.processing_time_ms,
+                    enhancement_mode=request.mode.value,
+                    enhancements_applied=enhancements,
+                    qc_status='pending',
+                    background_removed=bg_removed,
+                    needs_upscaling=needs_upscaling,
+                    image_type='primary',
+                    image_sequence=1,
+                    analysis_blur_score=result.analysis.get('blur_score') if hasattr(result, 'analysis') else None,
+                    analysis_brightness=result.analysis.get('brightness') if hasattr(result, 'analysis') else None,
+                    analysis_contrast=result.analysis.get('contrast') if hasattr(result, 'analysis') else None,
+                    analysis_noise=result.analysis.get('noise') if hasattr(result, 'analysis') else None,
+                    analysis_bg_complexity=result.analysis.get('bg_complexity') if hasattr(result, 'analysis') else None,
+                    analysis_metadata=result.analysis if hasattr(result, 'analysis') else None
+                )
+                product_image = existing_image
+                logger.info(f"[URL-ENHANCE] Updated existing record: {request.image_id}")
+            else:
+                raise HTTPException(404, f"Image ID {request.image_id} not found")
+        else:
+            # Create new record
+            product_image = image_repo.create(
+                sku_id=request.sku_id if request.sku_id else f"url_{image_id}",
+                image_url=original_https_url,
+                enhanced_image_url=enhanced_https_url,
+                original_filename=filename,
+                original_width=result.original_dimensions[0],
+                original_height=result.original_dimensions[1],
+                original_size_bytes=original_size,
+                enhanced_width=result.enhanced_dimensions[0],
+                enhanced_height=result.enhanced_dimensions[1],
+                enhanced_size_bytes=len(enhanced_bytes),
+                original_format=mime_type.split('/')[-1].upper(),
+                enhanced_format=request.output_format,
+                status=ProcessingStatus.COMPLETED.value,
+                processing_time_ms=result.processing_time_ms,
+                enhancement_mode=request.mode.value,
+                processed_at=datetime.utcnow(),
+                enhancements_applied=result.enhancements_applied if hasattr(result, 'enhancements_applied') else None
+            )
+            logger.info(f"[URL-ENHANCE] Database record created: {product_image.id}")
         
         # Create enhancement history record
         history_repo = EnhancementHistoryRepository(db)
@@ -889,8 +933,8 @@ async def enhance_gemini(
         logger.info(f"[GEMINI] Services initialized successfully")
         
         # Generate S3 keys
-        original_key = f"originals/{uuid.uuid4()}_{file.filename}"
-        enhanced_key = f"enhanced/{uuid.uuid4()}_{file.filename}"
+        original_key = f"uploads/original/{uuid.uuid4()}_{file.filename}"
+        enhanced_key = f"uploads/enhanced/{uuid.uuid4()}_{file.filename}"
         
         # Get file size and type
         file_size_kb = len(content) / 1024
@@ -1091,45 +1135,6 @@ async def create_batch_job(
     )
 
 
-@app.get("/api/v1/batch/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str):
-    """Get batch job status"""
-    # Try Redis first (faster)
-    if redis_client:
-        key = f"{config.redis.job_status_prefix}{job_id}"
-        data = redis_client.hgetall(key)
-        if data:
-            return JobStatusResponse(
-                job_id=job_id,
-                status=data.get('status', 'unknown'),
-                total_images=int(data.get('total', 0)),
-                processed_count=int(data.get('processed', 0)),
-                success_count=int(data.get('success', 0)),
-                failed_count=int(data.get('failed', 0)),
-                progress_percent=float(data.get('progress', 0)),
-                avg_processing_time_ms=float(data.get('avg_time')) if data.get('avg_time') else None
-            )
-    
-    # Fallback to database
-    db = get_db()
-    try:
-        job = JobRepository(db).get_by_id(job_id)
-        if not job:
-            raise HTTPException(404, "Job not found")
-        
-        return JobStatusResponse(
-            job_id=job_id,
-            status=job.status,
-            total_images=job.total_images,
-            processed_count=job.processed_count,
-            success_count=job.success_count,
-            failed_count=job.failed_count,
-            progress_percent=job.progress_percentage,
-            avg_processing_time_ms=job.avg_processing_time_ms
-        )
-    finally:
-        db.close()
-
 
 @app.post("/api/v1/import", response_model=Dict[str, Any])
 async def import_cloudfront_urls(request: ImportUrlsRequest):
@@ -1209,6 +1214,344 @@ async def list_images(
             "limit": limit,
             "offset": offset,
             "images": [img.to_dict() for img in images]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/v1/tasks/unapproved")
+async def get_unapproved_tasks(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0)
+):
+    """Get all unapproved enhancement tasks (unique SKU + image_url combinations)"""
+    db = get_db()
+    try:
+        from src.config import QCStatus
+        from sqlalchemy import func, distinct
+        
+        # Get unapproved images grouped by SKU + image_url
+        query = db.query(ImageRecord).filter(
+            ImageRecord.qc_status == QCStatus.PENDING.value,
+            ImageRecord.status == ProcessingStatus.COMPLETED.value
+        ).order_by(ImageRecord.created_at.desc())
+        
+        total = query.count()
+        images = query.offset(offset).limit(limit).all()
+        
+        tasks = []
+        hist_repo = EnhancementHistoryRepository(db)
+        
+        for img in images:
+            # Get latest enhancement history for this image
+            history = hist_repo.get_latest_by_image(img.id)
+            
+            task_data = {
+                "task_id": img.id,
+                "sku_id": img.sku_id,
+                "product_group_id": img.product_group_id,
+                "image_type": img.image_type,
+                "image_sequence": img.image_sequence,
+                "original_url": img.image_url,
+                "enhanced_url": img.enhanced_image_url,
+                "original_size_bytes": img.original_size_bytes,
+                "enhanced_size_bytes": img.enhanced_size_bytes,
+                "original_format": img.original_format,
+                "enhanced_format": img.enhanced_format,
+                "original_width": img.original_width,
+                "original_height": img.original_height,
+                "enhanced_width": img.enhanced_width,
+                "enhanced_height": img.enhanced_height,
+                "qc_status": img.qc_status,
+                "qc_score": img.qc_score,
+                "processing_time_ms": img.processing_time_ms,
+                "enhancements_applied": img.enhancements_applied or [],
+                "created_at": img.created_at.isoformat() if img.created_at else None,
+                "processed_at": img.processed_at.isoformat() if img.processed_at else None,
+            }
+            
+            # Add metrics if available
+            if history:
+                task_data["original_blur_score"] = history.original_blur_score
+                task_data["enhanced_blur_score"] = history.enhanced_blur_score
+                task_data["original_quality_score"] = history.original_quality_score
+                task_data["enhanced_quality_score"] = history.enhanced_quality_score
+                task_data["quality_metadata"] = history.quality_metadata
+            
+            tasks.append(task_data)
+        
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "tasks": tasks
+        }
+    except Exception as e:
+        logger.error(f"Error fetching unapproved tasks: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/tasks/{task_id}/approve")
+async def approve_task(
+    task_id: str,
+    qc_notes: Optional[str] = Form(None)
+):
+    """Approve an enhancement task (mark QC status as APPROVED)"""
+    db = get_db()
+    try:
+        from src.config import QCStatus
+        
+        image = db.query(ImageRecord).filter(ImageRecord.id == task_id).first()
+        if not image:
+            raise HTTPException(status_code=404, detail="Task not found")
+        
+        # Update QC status to APPROVED
+        image.qc_status = QCStatus.APPROVED.value
+        image.qc_reviewed_at = datetime.utcnow()
+        if qc_notes:
+            image.qc_notes = qc_notes
+        
+        db.commit()
+        
+        logger.info(f"Task {task_id} approved for SKU {image.sku_id}")
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "qc_status": image.qc_status,
+            "qc_reviewed_at": image.qc_reviewed_at.isoformat() if image.qc_reviewed_at else None
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error approving task {task_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/tasks/{task_id}/reject")
+async def reject_task(
+    task_id: str,
+    rejection_reason: Optional[str] = Form(None)
+):
+    """Reject an enhancement task (mark QC status as REJECTED)"""
+    db = get_db()
+    try:
+        from src.config import QCStatus
+        
+        image = db.query(ImageRecord).filter(ImageRecord.id == task_id).first()
+        if not image:
+            raise HTTPException(status_code=404, detail="Task not found")
+        
+        # Update QC status to REJECTED
+        image.qc_status = QCStatus.REJECTED.value
+        image.qc_reviewed_at = datetime.utcnow()
+        if rejection_reason:
+            image.qc_notes = f"Rejected: {rejection_reason}"
+        
+        db.commit()
+        
+        logger.info(f"Task {task_id} rejected for SKU {image.sku_id}")
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "qc_status": image.qc_status,
+            "rejection_reason": rejection_reason
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error rejecting task {task_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/v1/tasks/approved")
+async def get_approved_tasks(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0)
+):
+    """Get all approved enhancement tasks"""
+    db = get_db()
+    try:
+        from src.config import QCStatus
+        
+        query = db.query(ImageRecord).filter(
+            ImageRecord.qc_status == QCStatus.APPROVED.value,
+            ImageRecord.status == ProcessingStatus.COMPLETED.value
+        ).order_by(ImageRecord.qc_reviewed_at.desc())
+        
+        total = query.count()
+        images = query.offset(offset).limit(limit).all()
+        
+        tasks = []
+        hist_repo = EnhancementHistoryRepository(db)
+        
+        for img in images:
+            history = hist_repo.get_latest_by_image(img.id)
+            
+            task_data = {
+                "task_id": img.id,
+                "sku_id": img.sku_id,
+                "product_group_id": img.product_group_id,
+                "image_type": img.image_type,
+                "original_url": img.image_url,
+                "enhanced_url": img.enhanced_image_url,
+                "original_size_bytes": img.original_size_bytes,
+                "enhanced_size_bytes": img.enhanced_size_bytes,
+                "qc_status": img.qc_status,
+                "qc_reviewed_by": img.qc_reviewed_by,
+                "qc_reviewed_at": img.qc_reviewed_at.isoformat() if img.qc_reviewed_at else None,
+                "qc_notes": img.qc_notes,
+                "processing_time_ms": img.processing_time_ms,
+                "enhancements_applied": img.enhancements_applied or [],
+                "created_at": img.created_at.isoformat() if img.created_at else None,
+            }
+            
+            if history:
+                task_data["quality_metadata"] = history.quality_metadata
+            
+            tasks.append(task_data)
+        
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "tasks": tasks
+        }
+    except Exception as e:
+        logger.error(f"Error fetching approved tasks: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/batch/process")
+async def create_batch_process(
+    request: Dict[str, Any]
+):
+    """Create batch processing job for SKU IDs, image URLs, or auto-select pending images"""
+    db = get_db()
+    try:
+        from src.batch_processor import process_batch_async
+        
+        # Extract parameters from request body
+        sku_ids = request.get("sku_ids")
+        image_urls = request.get("image_urls")
+        auto_mode = request.get("auto_mode", False)
+        limit = request.get("limit", 100)
+        mode = request.get("mode", "auto")
+        batch_size = request.get("batch_size", 10)
+        
+        image_repo = ImageRepository(db)
+        job_repo = JobRepository(db)
+        
+        logger.info(f"Batch process request: auto_mode={auto_mode}, sku_ids={sku_ids}, image_urls={image_urls}, limit={limit}")
+        
+        # Find images to process
+        images_to_process = []
+        
+        if auto_mode:
+            # Auto-select unprocessed images
+            images_to_process = image_repo.get_unprocessed(limit=limit)
+            logger.info(f"AUTO mode: Found {len(images_to_process)} unprocessed images")
+        elif sku_ids:
+            for sku_id in sku_ids:
+                images = image_repo.get_by_sku(sku_id)
+                images_to_process.extend(images)
+        elif image_urls:
+            for url in image_urls:
+                img = image_repo.get_by_url(url)
+                if img:
+                    images_to_process.append(img)
+        
+        if not images_to_process:
+            raise HTTPException(400, "No images found to process")
+        
+        # Create job
+        job = job_repo.create(
+            job_type="batch",
+            enhancement_mode=mode,
+            total_images=len(images_to_process),
+            status=ProcessingStatus.QUEUED.value
+        )
+        
+        # Start async processing
+        image_ids = [img.id for img in images_to_process]
+        asyncio.create_task(process_batch_async(job.id, image_ids, mode, batch_size))
+        
+        return {
+            "success": True,
+            "job_id": job.id,
+            "total_images": len(images_to_process),
+            "batch_size": batch_size,
+            "status": "queued"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating batch job: {e}", exc_info=True)
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/v1/batch/jobs")
+async def list_batch_jobs(limit: int = Query(50, ge=1, le=100)):
+    """List all batch jobs"""
+    db = get_db()
+    try:
+        jobs = db.query(ProcessingJob).order_by(ProcessingJob.created_at.desc()).limit(limit).all()
+        
+        return {
+            "jobs": [
+                {
+                    "job_id": job.id,
+                    "status": job.status,
+                    "job_type": job.job_type,
+                    "enhancement_mode": job.enhancement_mode,
+                    "total_images": job.total_images,
+                    "processed_count": job.processed_count,
+                    "success_count": job.success_count,
+                    "failed_count": job.failed_count,
+                    "skipped_count": job.skipped_count,
+                    "progress_percent": job.progress_percentage,
+                    "created_at": job.created_at.isoformat() if job.created_at else None,
+                    "started_at": job.started_at.isoformat() if job.started_at else None,
+                    "completed_at": job.completed_at.isoformat() if job.completed_at else None
+                }
+                for job in jobs
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/v1/batch/status/{job_id}")
+async def get_batch_job_status(job_id: str):
+    """Get batch job status"""
+    db = get_db()
+    try:
+        job = JobRepository(db).get_by_id(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        
+        return {
+            "job_id": job.id,
+            "status": job.status,
+            "total_images": job.total_images,
+            "processed_count": job.processed_count,
+            "success_count": job.success_count,
+            "failed_count": job.failed_count,
+            "progress_percent": job.progress_percentage,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "error_message": job.error_message
         }
     finally:
         db.close()
