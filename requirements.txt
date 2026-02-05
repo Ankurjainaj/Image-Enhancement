@@ -29,9 +29,8 @@ pandas
 # Pydantic for data validation
 pydantic
 
-# Optional: Better background removal (requires ~500MB)
-# Uncomment for AI-powered background removal
-rembg
+# Background removal with CPU support
+rembg[cpu]
 
 # Optional: Quality assessment (requires PyTorch)
 # Uncomment if you want BRISQUE scoring

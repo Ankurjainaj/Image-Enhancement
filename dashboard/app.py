@@ -45,6 +45,16 @@ init_db()
 enhancer = ImageEnhancer()
 assessor = QualityAssessor()
 
+# Initialize session state for task approvals
+if "show_reject_reasons" not in st.session_state:
+    st.session_state.show_reject_reasons = {}
+
+if "task_filter_status" not in st.session_state:
+    st.session_state.task_filter_status = "All"
+
+if "refresh_tasks" not in st.session_state:
+    st.session_state.refresh_tasks = False
+
 
 # Custom CSS for Professional Demo Look
 st.markdown("""
@@ -252,7 +262,7 @@ def get_image_from_url(url: str, timeout: int = 30) -> Optional[bytes]:
         response.raise_for_status()
         return response.content
     except Exception as e:
-        st.error(f"Failed to fetch image: {e}")
+        logger.error(f"Failed to fetch image from {url}: {e}")
         return None
 
 
@@ -681,6 +691,588 @@ def render_single_enhancement():
                         st.error(f"Error calling API: {str(e)}")
 
 
+def render_my_tasks():
+    """Render My Tasks tab with approval workflow"""
+    st.subheader("✅ My Tasks - Approval Queue")
+    
+    st.markdown("""
+    Review and approve enhanced images before publishing. 
+    **Images are shown at 300x300px for quick review.**
+    """)
+    
+    # Stats columns
+    col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+    
+    # Fetch unapproved tasks
+    try:
+        api_url = f"http://localhost:{config.api.port}"
+        response = requests.get(
+            f"{api_url}/api/v1/tasks/unapproved",
+            params={"limit": 100}
+        )
+        response.raise_for_status()
+        data = response.json()
+        tasks = data.get("tasks", [])
+        total_tasks = data.get("total", 0)
+        
+        with col_stat1:
+            st.metric("📋 Pending Review", total_tasks)
+        
+        with col_stat2:
+            st.metric("🖼️ Total Images", len(tasks))
+        
+        with col_stat3:
+            if tasks:
+                avg_improvement = 0
+                count = 0
+                for task in tasks:
+                    orig = task.get("original_quality_score")
+                    enh = task.get("enhanced_quality_score")
+                    if orig is not None and enh is not None:
+                        try:
+                            avg_improvement += (float(enh) - float(orig))
+                            count += 1
+                        except:
+                            pass
+                avg_improvement = avg_improvement / count if count > 0 else 0
+                st.metric("📈 Avg Quality Improvement", f"+{avg_improvement:.1f}%")
+        
+        with col_stat4:
+            if tasks:
+                total_processing_ms = sum(task.get("processing_time_ms", 0) for task in tasks)
+                avg_time_ms = total_processing_ms / len(tasks)
+                st.metric("⏱️ Avg Processing Time", f"{avg_time_ms:.0f}ms")
+        
+        if not tasks:
+            st.success("🎉 No pending approvals! All images have been reviewed.")
+            return
+        
+        st.divider()
+        
+        # Filter options
+        col_filter1, col_filter2, col_filter3 = st.columns(3)
+        
+        with col_filter1:
+            search_sku = st.text_input("🔍 Search by SKU ID", "")
+        
+        with col_filter2:
+            sort_by = st.selectbox("Sort by:", ["Latest", "SKU ID", "Quality Improvement", "File Size"])
+        
+        with col_filter3:
+            items_per_page = st.slider("Items per page:", 5, 50, 10)
+        
+        # Filter and sort tasks
+        filtered_tasks = tasks
+        
+        if search_sku:
+            filtered_tasks = [t for t in filtered_tasks if search_sku.lower() in t.get("sku_id", "").lower()]
+        
+        if sort_by == "SKU ID":
+            filtered_tasks.sort(key=lambda x: x.get("sku_id", ""))
+        elif sort_by == "Quality Improvement":
+            filtered_tasks.sort(
+                key=lambda x: float(x.get("enhanced_quality_score", 0) or 0) - float(x.get("original_quality_score", 0) or 0),
+                reverse=True
+            )
+        elif sort_by == "File Size":
+            filtered_tasks.sort(key=lambda x: x.get("enhanced_size_bytes", 0), reverse=True)
+        # Latest is default (already sorted by created_at in API)
+        
+        st.info(f"📋 Showing {len(filtered_tasks)} tasks" + (f" matching '{search_sku}'" if search_sku else ""))
+        
+        # Pagination
+        total_pages = (len(filtered_tasks) + items_per_page - 1) // items_per_page
+        col_prev, col_page, col_next = st.columns([1, 4, 1])
+        
+        if "current_page" not in st.session_state:
+            st.session_state.current_page = 1
+        
+        with col_prev:
+            if st.button("⬅️ Previous"):
+                st.session_state.current_page = max(1, st.session_state.current_page - 1)
+        
+        with col_page:
+            st.markdown(f"**Page {st.session_state.current_page} of {total_pages}**", unsafe_allow_html=True)
+        
+        with col_next:
+            if st.button("Next ➡️"):
+                st.session_state.current_page = min(total_pages, st.session_state.current_page + 1)
+        
+        # Get paginated tasks
+        start_idx = (st.session_state.current_page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        paginated_tasks = filtered_tasks[start_idx:end_idx]
+        
+        st.divider()
+        
+        # Create table header
+        col_headers = st.columns([1.2, 1.2, 1.2, 1.2, 0.8, 0.8, 0.6])
+        with col_headers[0]:
+            st.markdown("**SKU ID**")
+        with col_headers[1]:
+            st.markdown("**Original**")
+        with col_headers[2]:
+            st.markdown("**Enhanced**")
+        with col_headers[3]:
+            st.markdown("**Scores**")
+        with col_headers[4]:
+            st.markdown("**Info**")
+        with col_headers[5]:
+            st.markdown("**Actions**")
+        with col_headers[6]:
+            st.markdown("**Status**")
+        
+        st.divider()
+        
+        # Iterate through paginated tasks
+        for idx, task in enumerate(paginated_tasks):
+            task_id = task.get("task_id", "")
+            sku_id = task.get("sku_id", "N/A")
+            original_url = task.get("original_url", "")
+            enhanced_url = task.get("enhanced_url", "")
+            
+            # Quality metrics
+            orig_blur = task.get("original_blur_score")
+            enh_blur = task.get("enhanced_blur_score")
+            orig_quality = task.get("original_quality_score")
+            enh_quality = task.get("enhanced_quality_score")
+            
+            # Size metrics
+            orig_size_bytes = task.get("original_size_bytes", 0)
+            enh_size_bytes = task.get("enhanced_size_bytes", 0)
+            orig_size_kb = orig_size_bytes / 1024 if orig_size_bytes else 0
+            enh_size_kb = enh_size_bytes / 1024 if enh_size_bytes else 0
+            
+            # Dimensions
+            orig_w = task.get("original_width", 0)
+            orig_h = task.get("original_height", 0)
+            enh_w = task.get("enhanced_width", 0)
+            enh_h = task.get("enhanced_height", 0)
+            
+            # Create row
+            col1, col2, col3, col4, col5, col6, col7 = st.columns([1.2, 1.2, 1.2, 1.2, 0.8, 0.8, 0.6])
+            
+            with col1:
+                st.markdown(f"**`{sku_id}`**")
+                st.caption(f"Type: {task.get('image_type', 'N/A')}")
+            
+            with col2:
+                # Original image thumbnail with expander for full view
+                if original_url:
+                    try:
+                        img_bytes = get_image_from_url(original_url, timeout=10)
+                        if img_bytes:
+                            img = Image.open(io.BytesIO(img_bytes))
+                            img_display = img.copy()
+                            img_display.thumbnail((300, 300), Image.Resampling.LANCZOS)
+                            st.image(img_display, use_container_width=True)
+                        else:
+                            st.warning("❌ Cannot load")
+                    except Exception as e:
+                        st.warning(f"❌ Load error")
+                        logger.error(f"Error loading image {original_url}: {e}")
+                
+                st.caption(f"📦 {orig_size_kb:.1f}KB")
+                st.caption(f"📐 {orig_w}×{orig_h}px" if orig_w and orig_h else "📐 N/A")
+            
+            with col3:
+                # Enhanced image thumbnail
+                if enhanced_url:
+                    try:
+                        img_bytes = get_image_from_url(enhanced_url, timeout=10)
+                        if img_bytes:
+                            img = Image.open(io.BytesIO(img_bytes))
+                            img_display = img.copy()
+                            img_display.thumbnail((300, 300), Image.Resampling.LANCZOS)
+                            st.image(img_display, use_container_width=True)
+                        else:
+                            st.warning("❌ Cannot load")
+                    except Exception as e:
+                        st.warning(f"❌ Load error")
+                        logger.error(f"Error loading image {enhanced_url}: {e}")
+                
+                st.caption(f"📦 {enh_size_kb:.1f}KB")
+                st.caption(f"📐 {enh_w}×{enh_h}px" if enh_w and enh_h else "📐 N/A")
+            
+            with col4:
+                # Quality metrics with color coding
+                st.markdown("**Quality:**")
+                
+                if orig_quality is not None:
+                    try:
+                        orig_q = float(orig_quality)
+                        st.caption(f"Original: {orig_q:.1f}")
+                    except:
+                        pass
+                
+                if enh_quality is not None:
+                    try:
+                        enh_q = float(enh_quality)
+                        improvement = enh_q - (float(orig_quality) if orig_quality else 0)
+                        
+                        if improvement > 0:
+                            st.caption(f"✅ Enhanced: {enh_q:.1f} (+{improvement:.1f})")
+                        else:
+                            st.caption(f"⚠️ Enhanced: {enh_q:.1f} ({improvement:.1f})")
+                    except:
+                        pass
+                
+                # Show enhancements applied
+                enhancements = task.get('enhancements_applied', [])
+                if enhancements:
+                    st.caption(f"🔧 {', '.join(enhancements)}")
+            
+            with col5:
+                # Metrics & info
+                st.caption(f"🔧 {len(task.get('enhancements_applied', []))} ops")
+                st.caption(f"⏱️ {task.get('processing_time_ms', 0)}ms")
+                if orig_size_kb > 0:
+                    reduction_pct = (1 - enh_size_kb / orig_size_kb) * 100
+                    st.caption(f"📉 {reduction_pct:.1f}% smaller")
+            
+            with col6:
+                # Action buttons - stacked vertically
+                col_approve, col_reject = st.columns(2)
+                
+                with col_approve:
+                    if st.button("✅", key=f"approve_{task_id}", help="Approve this task"):
+                        with st.spinner("Approving..."):
+                            try:
+                                api_url = f"http://localhost:{config.api.port}"
+                                approve_response = requests.post(
+                                    f"{api_url}/api/v1/tasks/{task_id}/approve"
+                                )
+                                if approve_response.status_code == 200:
+                                    st.toast("✅ Approved!", icon="✅")
+                                    st.session_state.refresh_tasks = not st.session_state.refresh_tasks
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error(f"Error: {approve_response.status_code}")
+                            except Exception as e:
+                                st.error(f"Error: {str(e)}")
+                
+                with col_reject:
+                    if st.button("❌", key=f"reject_btn_{task_id}", help="Reject this task"):
+                        st.session_state[f"show_reject_{task_id}"] = True
+            
+            with col7:
+                status_badge = task.get("qc_status", "PENDING")
+                if status_badge == "APPROVED":
+                    st.success("✅")
+                elif status_badge == "REJECTED":
+                    st.error("❌")
+                else:
+                    st.warning("⏳")
+            
+            # Reject reason input (inline)
+            if st.session_state.get(f"show_reject_{task_id}"):
+                st.warning(f"Rejecting task for {sku_id}")
+                reason = st.text_area(
+                    f"Why reject this image?",
+                    key=f"reason_{task_id}",
+                    height=80
+                )
+                col_confirm, col_cancel, col_space = st.columns([1, 1, 2])
+                
+                with col_confirm:
+                    if st.button("✓ Confirm", key=f"confirm_reject_{task_id}"):
+                        with st.spinner("Rejecting..."):
+                            try:
+                                api_url = f"http://localhost:{config.api.port}"
+                                reject_response = requests.post(
+                                    f"{api_url}/api/v1/tasks/{task_id}/reject",
+                                    data={"rejection_reason": reason}
+                                )
+                                if reject_response.status_code == 200:
+                                    st.toast("❌ Rejected!", icon="❌")
+                                    st.session_state[f"show_reject_{task_id}"] = False
+                                    st.session_state.refresh_tasks = not st.session_state.refresh_tasks
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error(f"Error: {reject_response.status_code}")
+                            except Exception as e:
+                                st.error(f"Error: {str(e)}")
+                
+                with col_cancel:
+                    if st.button("✕ Cancel", key=f"cancel_reject_{task_id}"):
+                        st.session_state[f"show_reject_{task_id}"] = False
+            
+            st.divider()
+        
+    except Exception as e:
+        st.error(f"Error loading tasks: {str(e)}")
+        logger.error(f"Error in render_my_tasks: {e}", exc_info=True)
+
+
+def render_approved_tasks():
+    """Render approved tasks tab"""
+    st.subheader("✅ Approved Images")
+    st.markdown("View all approved and published images.")
+    
+    try:
+        api_url = f"http://localhost:{config.api.port}"
+        response = requests.get(f"{api_url}/api/v1/tasks/approved", params={"limit": 100})
+        response.raise_for_status()
+        data = response.json()
+        tasks = data.get("tasks", [])
+        total_tasks = data.get("total", 0)
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("✅ Total Approved", total_tasks)
+        with col2:
+            if tasks:
+                avg_size_reduction = sum(
+                    (1 - t.get("enhanced_size_bytes", 0) / max(t.get("original_size_bytes", 1), 1)) * 100
+                    for t in tasks if t.get("original_size_bytes")
+                ) / len(tasks)
+                st.metric("💾 Avg Size Reduction", f"{avg_size_reduction:.1f}%")
+        with col3:
+            if tasks:
+                avg_time = sum(t.get("processing_time_ms", 0) for t in tasks) / len(tasks)
+                st.metric("⏱️ Avg Processing Time", f"{avg_time:.0f}ms")
+        
+        if not tasks:
+            st.info("No approved images yet.")
+            return
+        
+        st.divider()
+        
+        # Search
+        search_sku = st.text_input("🔍 Search by SKU ID", "", key="approved_search_sku")
+        
+        filtered_tasks = tasks
+        if search_sku:
+            filtered_tasks = [t for t in filtered_tasks if search_sku.lower() in t.get("sku_id", "").lower()]
+        
+        st.info(f"📋 Showing {len(filtered_tasks)} approved images")
+        st.divider()
+        
+        # Table header
+        col_headers = st.columns([1.5, 1.5, 1, 0.5])
+        with col_headers[0]:
+            st.markdown("**SKU ID**")
+        with col_headers[1]:
+            st.markdown("**Approved Date**")
+        with col_headers[2]:
+            st.markdown("**Reviewer**")
+        with col_headers[3]:
+            st.markdown("**View**")
+        
+        st.divider()
+        
+        # Display rows
+        for task in filtered_tasks:
+            task_id = task.get("task_id", "")
+            sku_id = task.get("sku_id", "N/A")
+            original_url = task.get("original_url", "")
+            enhanced_url = task.get("enhanced_url", "")
+            reviewed_at = task.get("qc_reviewed_at", "")
+            reviewer = task.get("qc_reviewed_by", "N/A")
+            
+            col1, col2, col3, col4 = st.columns([1.5, 1.5, 1, 0.5])
+            
+            with col1:
+                st.markdown(f"**`{sku_id}`**")
+            
+            with col2:
+                if reviewed_at:
+                    st.text(reviewed_at[:10])
+                else:
+                    st.text("N/A")
+            
+            with col3:
+                st.text(reviewer)
+            
+            with col4:
+                if st.button("👁️", key=f"view_{task_id}", help="View images"):
+                    st.session_state[f"show_images_{task_id}"] = not st.session_state.get(f"show_images_{task_id}", False)
+            
+            # Show images if toggled
+            if st.session_state.get(f"show_images_{task_id}", False):
+                with st.spinner("Loading images..."):
+                    img_col1, img_col2 = st.columns(2)
+                    
+                    with img_col1:
+                        st.caption("**Original**")
+                        if original_url:
+                            try:
+                                img_bytes = get_image_from_url(original_url, timeout=10)
+                                if img_bytes:
+                                    img = Image.open(io.BytesIO(img_bytes))
+                                    st.image(img, use_container_width=True)
+                                    st.caption(f"🔗 {original_url}")
+                                else:
+                                    st.warning("❌ Cannot load")
+                            except Exception as e:
+                                st.warning(f"❌ Load error: {str(e)[:50]}")
+                    
+                    with img_col2:
+                        st.caption("**Enhanced**")
+                        if enhanced_url:
+                            try:
+                                img_bytes = get_image_from_url(enhanced_url, timeout=10)
+                                if img_bytes:
+                                    img = Image.open(io.BytesIO(img_bytes))
+                                    st.image(img, use_container_width=True)
+                                    st.caption(f"🔗 {enhanced_url}")
+                                else:
+                                    st.warning("❌ Cannot load")
+                            except Exception as e:
+                                st.warning(f"❌ Load error: {str(e)[:50]}")
+            
+            st.divider()
+    
+    except Exception as e:
+        st.error(f"Error loading approved tasks: {str(e)}")
+        logger.error(f"Error in render_approved_tasks: {e}", exc_info=True)
+
+
+def render_batch_process():
+    """Render batch processing tab"""
+    st.subheader("📦 Batch Process")
+    st.markdown("Process multiple images in batch mode")
+    
+    # Input section
+    st.markdown("### Input")
+    
+    input_type = st.radio("Select input type:", ["AUTO", "SKU IDs", "Image URLs"], horizontal=True)
+    
+    if input_type == "AUTO":
+        st.info("🤖 AUTO mode will automatically select pending images from the database")
+        limit = st.number_input("Max images to process", min_value=1, max_value=1000, value=100)
+        batch_size = st.number_input("Batch size (images per batch)", min_value=1, max_value=50, value=10)
+        st.caption("Smaller batch sizes reduce server load")
+    elif input_type == "SKU IDs":
+        sku_input = st.text_area(
+            "Enter SKU IDs (one per line)",
+            height=150,
+            placeholder="SKU-001\nSKU-002\nSKU-003"
+        )
+        sku_ids = [s.strip() for s in sku_input.split('\n') if s.strip()]
+        st.info(f"📊 {len(sku_ids)} SKU IDs entered")
+        batch_size = st.number_input("Batch size", min_value=1, max_value=50, value=10)
+    else:
+        url_input = st.text_area(
+            "Enter Image URLs (one per line)",
+            height=150,
+            placeholder="https://example.com/image1.jpg\nhttps://example.com/image2.jpg"
+        )
+        image_urls = [u.strip() for u in url_input.split('\n') if u.strip()]
+        st.info(f"📊 {len(image_urls)} URLs entered")
+        batch_size = st.number_input("Batch size", min_value=1, max_value=50, value=10)
+    
+    mode = st.selectbox("Enhancement Mode", ["auto", "full", "light_correction", "upscale"])
+    
+    if st.button("🚀 Start Batch Processing", type="primary", use_container_width=True):
+        try:
+            api_url = f"http://localhost:{config.api.port}"
+            
+            payload = {"mode": mode, "batch_size": batch_size}
+            
+            if input_type == "AUTO":
+                payload["auto_mode"] = True
+                payload["limit"] = limit
+            elif input_type == "SKU IDs":
+                if not sku_ids:
+                    st.error("Please enter at least one SKU ID")
+                    return
+                payload["sku_ids"] = sku_ids
+            else:
+                if not image_urls:
+                    st.error("Please enter at least one image URL")
+                    return
+                payload["image_urls"] = image_urls
+            
+            with st.spinner("Creating batch job..."):
+                response = requests.post(f"{api_url}/api/v1/batch/process", json=payload)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    st.success(f"✅ Batch job created! Job ID: {result['job_id']}")
+                    st.info(f"📊 Total images: {result['total_images']} | Batch size: {result['batch_size']}")
+                    st.session_state.refresh_batch_jobs = True
+                else:
+                    st.error(f"Error: {response.text}")
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+    
+    st.divider()
+    
+    # Jobs list
+    st.markdown("### Batch Jobs")
+    
+    col_refresh, col_auto = st.columns([1, 3])
+    with col_refresh:
+        if st.button("🔄 Refresh"):
+            st.session_state.refresh_batch_jobs = True
+    
+    try:
+        api_url = f"http://localhost:{config.api.port}"
+        response = requests.get(f"{api_url}/api/v1/batch/jobs")
+        
+        if response.status_code == 404:
+            st.warning("⚠️ Batch jobs endpoint not available. Please restart the API server.")
+            return
+        
+        response.raise_for_status()
+        data = response.json()
+        jobs = data.get("jobs", [])
+        
+        if not jobs:
+            st.info("No batch jobs yet")
+            return
+        
+        # Display jobs
+        for job in jobs:
+            job_id = job.get("job_id", "")
+            status = job.get("status", "unknown")
+            total = job.get("total_images", 0)
+            processed = job.get("processed_count", 0)
+            success = job.get("success_count", 0)
+            failed = job.get("failed_count", 0)
+            progress = job.get("progress_percent", 0)
+            
+            with st.expander(f"📊 Job {job_id[:8]}... - {status.upper()}", expanded=(status == "processing")):
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Total", total)
+                with col2:
+                    st.metric("Processed", processed)
+                with col3:
+                    st.metric("Success", success)
+                with col4:
+                    st.metric("Failed", failed)
+                
+                # Progress bar
+                st.progress(progress / 100 if progress else 0)
+                st.caption(f"Progress: {progress:.1f}%")
+                
+                # Timestamps
+                st.caption(f"📅 Created: {job.get('created_at', 'N/A')[:19]}")
+                if job.get('started_at'):
+                    st.caption(f"▶️ Started: {job.get('started_at', 'N/A')[:19]}")
+                if job.get('completed_at'):
+                    st.caption(f"✅ Completed: {job.get('completed_at', 'N/A')[:19]}")
+                
+                # Status badge
+                if status == "completed":
+                    st.success("✅ Completed")
+                elif status == "processing":
+                    st.info("⏳ Processing...")
+                elif status == "failed":
+                    st.error(f"❌ Failed: {job.get('error_message', 'Unknown error')}")
+                elif status == "queued":
+                    st.warning("⏱️ Queued")
+    
+    except Exception as e:
+        st.error(f"Error loading batch jobs: {str(e)}")
+        logger.error(f"Error in render_batch_process: {e}", exc_info=True)
+
+
 def render_batch_import():
     """Render batch import UI"""
     st.subheader("📦 Batch Import")
@@ -788,56 +1380,21 @@ def main():
     </div>
     """, unsafe_allow_html=True)
     
-    # Sidebar
-    with st.sidebar:
-        st.markdown("### 🎛️ Control Panel")
-        st.markdown("---")
-        
-        # Status indicator
-        st.markdown("#### 📡 System Status")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("🟢 **API**")
-        with col2:
-            st.markdown("🟢 **DB**")
-        
-        st.markdown("---")
-        
-        st.markdown("#### 🔗 API Endpoints")
-        st.code("POST /api/v1/enhance/url", language=None)
-        st.code("POST /api/v1/enhance/upload", language=None)
-        
-        st.markdown("---")
-        
-        st.markdown("#### 📚 Documentation")
-        st.markdown("• [📄 API Docs](http://localhost:8000/docs)")
-        st.markdown("• [❤️ Health Check](http://localhost:8000/health)")
-        st.markdown("• [📊 Stats](http://localhost:8000/api/v1/stats)")
-        
-        st.markdown("---")
-        
-        if st.button("🔄 Refresh Dashboard", use_container_width=True):
-            st.rerun()
-        
-        st.markdown("---")
-        st.markdown(
-            "<div style='text-align: center; color: #6c757d; font-size: 0.8rem;'>"
-            "v2.0.0 • Built with ❤️"
-            "</div>",
-            unsafe_allow_html=True
-        )
-    
     # Main content - KPI cards
     render_kpi_cards()
     
     st.markdown("---")
     
     # Tabs for different views
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "🚀 Quick Enhance",
         "📊 Analytics", 
+        "✅ My Tasks",
+        "✅ Approved",
+        "📦 Batch Process",
         "📦 Batch Import",
-        "🕐 History"
+        "🕐 History",
+        "📋 Batch Jobs"
     ])
     
     with tab1:
@@ -886,10 +1443,49 @@ def main():
                 db.close()
     
     with tab3:
-        render_batch_import()
+        render_my_tasks()
     
     with tab4:
+        render_approved_tasks()
+    
+    with tab5:
+        render_batch_process()
+    
+    with tab6:
+        render_batch_import()
+    
+    with tab7:
         render_recent_images()
+    
+    with tab8:
+        st.header("📋 Batch Jobs")
+        
+        try:
+            response = requests.get(f"http://localhost:{config.api.port}/api/v1/batch/jobs?limit=100")
+            if response.status_code == 200:
+                data = response.json()
+                jobs = data.get("jobs", [])
+                
+                if jobs:
+                    df = pd.DataFrame(jobs)
+                    
+                    for col in ['created_at', 'started_at', 'completed_at']:
+                        if col in df.columns:
+                            df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    display_cols = ['job_id', 'status', 'total_images', 'processed_count', 'success_count', 'failed_count', 'skipped_count', 'progress_percent', 'created_at', 'started_at', 'completed_at']
+                    available_cols = [col for col in display_cols if col in df.columns]
+                    
+                    st.dataframe(df[available_cols], use_container_width=True, height=600)
+                    st.caption(f"📊 Total Jobs: {len(jobs)}")
+                else:
+                    st.info("ℹ️ No batch jobs found")
+            else:
+                st.error(f"❌ API Error {response.status_code}: {response.text}")
+        except requests.exceptions.ConnectionError:
+            st.warning("⚠️ Cannot connect to API server. Please restart the API server.")
+        except Exception as e:
+            st.error(f"❌ Error: {str(e)}")
     
     # Professional Footer
     st.markdown("""

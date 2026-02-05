@@ -24,6 +24,7 @@ from enum import Enum
 import cv2
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from rembg import remove
 
 from .config import get_config, EnhancementMode, EnhancementParams
 from .logging_config import RequestLogger
@@ -337,6 +338,7 @@ class ImageEnhancer:
             enhanced = img.copy()
             enhancements = []
             total_ai_cost = 0.0
+            bg_mask = None
             
             logger.info("⚙️ STEP 3: Applying Enhancements...")
             
@@ -354,7 +356,23 @@ class ImageEnhancer:
                     bedrock_result = self.bedrock.remove_background(pil_img, background_color)
                     
                     if bedrock_result.success and bedrock_result.image:
-                        enhanced = cv2.cvtColor(np.array(bedrock_result.image), cv2.COLOR_RGB2BGR)
+                        pil_out = bedrock_result.image
+                        # extract alpha if present
+                        try:
+                            if "A" in pil_out.mode:
+                                alpha = np.array(pil_out.split()[3]).astype(np.uint8)
+                                bg_mask = (alpha.astype(np.float32) / 255.0)
+                                # smooth
+                                try:
+                                    mask_blur = cv2.GaussianBlur((bg_mask * 255).astype(np.uint8), (5,5), 0)
+                                    bg_mask = (mask_blur.astype(np.float32)/255.0)
+                                except Exception:
+                                    pass
+                            else:
+                                bg_mask = None
+                        except Exception:
+                            bg_mask = None
+                        enhanced = cv2.cvtColor(np.array(pil_out.convert("RGB")), cv2.COLOR_RGB2BGR)
                         enhancements.append("ai_background_removal")
                         result.ai_used = True
                         total_ai_cost += bedrock_result.estimated_cost
@@ -366,31 +384,31 @@ class ImageEnhancer:
                     else:
                         # Fallback to local
                         logger.warning(f"   ⚠️ AI BG removal failed: {bedrock_result.error}, falling back to local")
-                        enhanced, bg_removed = self._remove_background_grabcut(enhanced, background_color)
-                        if bg_removed:
+                        enhanced, bg_mask = self._remove_background_grabcut(enhanced, background_color)
+                        if bg_mask is not None:
                             enhancements.append("local_background_removal_fallback")
                 else:
                     # Use local GrabCut
                     logger.info("")
                     logger.info("💻 USING LOCAL: Background Removal (GrabCut)")
                     logger.info(f"   Reason: {routing.reason if routing else 'Default'}")
-                    enhanced, bg_removed = self._remove_background_grabcut(enhanced, background_color)
-                    if bg_removed:
+                    enhanced, bg_mask = self._remove_background_grabcut(enhanced, background_color)
+                    if bg_mask is not None:
                         enhancements.append("local_background_removal")
                         result.processing_steps.append(ProcessingStep(
-                            name="background_removal", method="local", success=bg_removed,
+                            name="background_removal", method="local", success=(bg_mask is not None),
                             latency_ms=int((time.time() - step_start) * 1000),
                             details="GrabCut algorithm"
                         ))
                 
-                result.background_removed = True
+                result.background_removed = True if bg_mask is not None else False
                 step_time = int((time.time() - step_start) * 1000)
                 logger.info(f"   ✅ Background Removal Complete | Time: {step_time}ms")
             
             # --- 3b. Apply Mode-Specific Enhancements ---
             if mode == EnhancementMode.AUTO:
                 enhanced, mode_enhancements, mode_steps = self._auto_enhance_with_routing(
-                    enhanced, metrics, routing_decisions
+                    enhanced, metrics, routing_decisions, mask=bg_mask
                 )
                 enhancements.extend(mode_enhancements)
                 result.processing_steps.extend(mode_steps)
@@ -454,7 +472,9 @@ class ImageEnhancer:
                 
             elif mode == EnhancementMode.STANDARDIZE:
                 config = standardization_config or StandardizationConfig(background_color=background_color)
-                enhanced = self.standardize_image(enhanced, config)
+                enhanced, transformed_mask = self.standardize_image(enhanced, config, mask=bg_mask)
+                if transformed_mask is not None:
+                    bg_mask = transformed_mask
                 enhancements.append("standardization")
                 standardize = False
                 
@@ -488,7 +508,7 @@ class ImageEnhancer:
                 
             elif mode == EnhancementMode.FULL:
                 enhanced, full_enhancements, full_steps = self._full_enhance_with_routing(
-                    enhanced, metrics, routing_decisions, remove_background, background_color
+                    enhanced, metrics, routing_decisions, remove_background, background_color, incoming_mask=bg_mask
                 )
                 enhancements.extend(full_enhancements)
                 result.processing_steps.extend(full_steps)
@@ -502,7 +522,10 @@ class ImageEnhancer:
                 step_start = time.time()
                 logger.info("📐 STEP 4: Standardization...")
                 config = standardization_config or StandardizationConfig(background_color=background_color)
-                enhanced = self.standardize_image(enhanced, config)
+                enhanced, transformed_mask = self.standardize_image(enhanced, config, mask=bg_mask)
+                # update bg_mask to the transformed mask so later ops continue to use it
+                if transformed_mask is not None:
+                    bg_mask = transformed_mask
                 enhancements.append("standardization")
                 logger.info(f"   ✅ Standardization Complete | Time: {int((time.time() - step_start) * 1000)}ms")
             
@@ -548,7 +571,8 @@ class ImageEnhancer:
         self, 
         img: np.ndarray, 
         metrics: Dict, 
-        routing: List[RoutingDecision]
+        routing: List[RoutingDecision],
+        mask: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, List[str], List[ProcessingStep]]:
         """Auto enhance with smart routing"""
         enhancements = []
@@ -559,7 +583,7 @@ class ImageEnhancer:
         # Denoise if needed
         if metrics["noise_level"] > 15:
             step_start = time.time()
-            img = self._smart_denoise(img, strength=min(metrics["noise_level"] / 2, 20))
+            img = self._apply_masked(img, mask, self._smart_denoise, strength=min(metrics["noise_level"] / 2, 20))
             enhancements.append("denoise")
             steps.append(ProcessingStep(
                 name="denoise", method="local", success=True,
@@ -570,7 +594,7 @@ class ImageEnhancer:
         # Fix brightness
         if metrics["brightness"] < 80:
             step_start = time.time()
-            img = self._adjust_brightness(img, factor=1.2)
+            img = self._apply_masked(img, mask, self._adjust_brightness, factor=1.2)
             enhancements.append("brightness_boost")
             steps.append(ProcessingStep(
                 name="brightness", method="local", success=True,
@@ -578,7 +602,7 @@ class ImageEnhancer:
             ))
         elif metrics["brightness"] > 200:
             step_start = time.time()
-            img = self._adjust_brightness(img, factor=0.85)
+            img = self._apply_masked(img, mask, self._adjust_brightness, factor=0.85)
             enhancements.append("brightness_reduce")
             steps.append(ProcessingStep(
                 name="brightness", method="local", success=True,
@@ -588,7 +612,7 @@ class ImageEnhancer:
         # Fix contrast
         if metrics["contrast"] < 40:
             step_start = time.time()
-            img = self._apply_clahe(img)
+            img = self._apply_masked(img, mask, self._apply_clahe)
             enhancements.append("contrast_clahe")
             steps.append(ProcessingStep(
                 name="contrast", method="local", success=True,
@@ -599,7 +623,7 @@ class ImageEnhancer:
         if metrics["blur_score"] < 200:
             step_start = time.time()
             strength = 2.0 if metrics["blur_score"] < 100 else 1.5
-            img = self._smart_sharpen(img, strength=strength)
+            img = self._apply_masked(img, mask, self._smart_sharpen, strength=strength)
             enhancements.append("smart_sharpen")
             steps.append(ProcessingStep(
                 name="sharpen", method="local", success=True,
@@ -609,7 +633,7 @@ class ImageEnhancer:
         
         # Final touch
         step_start = time.time()
-        img = self._final_touch(img)
+        img = self._apply_masked(img, mask, self._final_touch)
         enhancements.append("final_touch")
         steps.append(ProcessingStep(
             name="final_touch", method="local", success=True,
@@ -617,6 +641,30 @@ class ImageEnhancer:
         ))
         
         return img, enhancements, steps
+
+    def _apply_masked(self, img: np.ndarray, mask: Optional[np.ndarray], func, *args, **kwargs) -> np.ndarray:
+        """Apply `func` to `img` but only retain changes inside `mask`.
+
+        If mask is None, applies func to the whole image.
+        The func should accept and return a numpy BGR image.
+        """
+        if mask is None:
+            return func(img, *args, **kwargs)
+
+        processed = func(img.copy(), *args, **kwargs)
+        try:
+            mask_f = mask.astype(np.float32)
+        except Exception:
+            mask_f = np.array(mask, dtype=np.float32)
+
+        if mask_f.ndim == 2:
+            mask_3 = np.stack([mask_f] * 3, axis=-1)
+        else:
+            mask_3 = mask_f
+
+        mask_3 = np.clip(mask_3, 0.0, 1.0)
+        combined = (processed.astype(np.float32) * mask_3 + img.astype(np.float32) * (1.0 - mask_3)).astype(np.uint8)
+        return combined
     
     def _full_enhance_with_routing(
         self,
@@ -624,7 +672,8 @@ class ImageEnhancer:
         metrics: Dict,
         routing: List[RoutingDecision],
         remove_bg: bool,
-        bg_color: Tuple[int, int, int]
+        bg_color: Tuple[int, int, int],
+        incoming_mask: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, List[str], List[ProcessingStep]]:
         """Full enhancement pipeline with smart routing"""
         enhancements = []
@@ -633,24 +682,43 @@ class ImageEnhancer:
         logger.info("   🔥 FULL Mode: Applying complete enhancement pipeline...")
         
         # 1. Background removal (only if requested)
-        if remove_bg:
+        mask = incoming_mask
+        if remove_bg and mask is None:
             step_start = time.time()
             bg_routing = self._get_routing_decision(routing, "background_removal")
             if bg_routing and bg_routing.use_ai:
                 pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 result = self.bedrock.remove_background(pil_img, bg_color)
                 if result.success:
-                    img = cv2.cvtColor(np.array(result.image), cv2.COLOR_RGB2BGR)
+                    pil_out = result.image
+                    try:
+                        if "A" in pil_out.mode:
+                            alpha = np.array(pil_out.split()[3]).astype(np.uint8)
+                            mask = (alpha.astype(np.float32) / 255.0)
+                            try:
+                                mask_blur = cv2.GaussianBlur((mask * 255).astype(np.uint8), (5,5), 0)
+                                mask = (mask_blur.astype(np.float32)/255.0)
+                            except Exception:
+                                pass
+                        else:
+                            mask = None
+                    except Exception:
+                        mask = None
+                    img = cv2.cvtColor(np.array(pil_out.convert("RGB")), cv2.COLOR_RGB2BGR)
                     enhancements.append("ai_bg_removal")
                     steps.append(ProcessingStep(
                         name="background_removal", method="ai", success=True,
                         latency_ms=result.latency_ms, cost_usd=result.estimated_cost
                     ))
                 else:
-                    img, _ = self._remove_background_grabcut(img, bg_color)
+                    img, mask = self._remove_background_grabcut(img, bg_color)
                     enhancements.append("local_bg_removal_fallback")
+                    steps.append(ProcessingStep(
+                        name="background_removal", method="local", success=True,
+                        latency_ms=int((time.time() - step_start) * 1000)
+                    ))
             else:
-                img, _ = self._remove_background_grabcut(img, bg_color)
+                img, mask = self._remove_background_grabcut(img, bg_color)
                 enhancements.append("local_bg_removal")
                 steps.append(ProcessingStep(
                     name="background_removal", method="local", success=True,
@@ -671,12 +739,12 @@ class ImageEnhancer:
                     latency_ms=result.latency_ms, cost_usd=result.estimated_cost
                 ))
             else:
-                img = self._light_correction(img)
-                img = self._color_balance(img)
+                img = self._apply_masked(img, mask, self._light_correction)
+                img = self._apply_masked(img, mask, self._color_balance)
                 enhancements.extend(["local_light_fallback", "color_balance"])
         else:
-            img = self._light_correction(img)
-            img = self._color_balance(img)
+            img = self._apply_masked(img, mask, self._light_correction)
+            img = self._apply_masked(img, mask, self._color_balance)
             enhancements.extend(["local_light_correction", "color_balance"])
             steps.append(ProcessingStep(
                 name="lighting", method="local", success=True,
@@ -685,7 +753,7 @@ class ImageEnhancer:
         
         # 3. Denoise
         step_start = time.time()
-        img = self._smart_denoise(img)
+        img = self._apply_masked(img, mask, self._smart_denoise)
         enhancements.append("denoise")
         steps.append(ProcessingStep(
             name="denoise", method="local", success=True,
@@ -708,10 +776,10 @@ class ImageEnhancer:
                         latency_ms=result.latency_ms, cost_usd=result.estimated_cost
                     ))
                 else:
-                    img = self._upscale_lanczos(img, self.params.upscale_factor)
+                    img = self._apply_masked(img, mask, self._upscale_lanczos, self.params.upscale_factor)
                     enhancements.append("local_upscale_fallback")
             else:
-                img = self._upscale_lanczos(img, self.params.upscale_factor)
+                img = self._apply_masked(img, mask, self._upscale_lanczos, self.params.upscale_factor)
                 enhancements.append("local_upscale")
                 steps.append(ProcessingStep(
                     name="upscale", method="local", success=True,
@@ -846,55 +914,74 @@ class ImageEnhancer:
         return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
     
     def _light_correction(self, img: np.ndarray) -> np.ndarray:
-        """Light correction - fix exposure and brightness"""
+        """Natural exposure correction with conditional CLAHE"""
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        
-        mean_brightness = np.mean(l)
-        target_brightness = 128
-        
-        if mean_brightness < 80:
-            adjustment = min(50, (target_brightness - mean_brightness) * 0.5)
-            l = cv2.add(l, int(adjustment))
-        elif mean_brightness > 180:
-            adjustment = min(50, (mean_brightness - target_brightness) * 0.5)
-            l = cv2.subtract(l, int(adjustment))
-        
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-        l = clahe.apply(l)
-        
+
+        mean_l = np.mean(l)
+        std_l = np.std(l)
+
+        # Gentle brightness shift
+        if mean_l < 90:
+            l = cv2.add(l, 6)
+        elif mean_l > 170:
+            l = cv2.subtract(l, 6)
+
+        # Apply CLAHE only if image is flat
+        if std_l < 45:
+            clahe = cv2.createCLAHE(clipLimit=0.6, tileGridSize=(16, 16))
+            l_clahe = clahe.apply(l)
+            l = cv2.addWeighted(l_clahe, 0.25, l, 0.75, 0)
+
         lab = cv2.merge([l, a, b])
         return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     
     def _color_balance(self, img: np.ndarray) -> np.ndarray:
-        """Gray-world white balance"""
-        result = img.copy().astype(np.float32)
-        
-        avg_b = np.mean(result[:, :, 0])
-        avg_g = np.mean(result[:, :, 1])
-        avg_r = np.mean(result[:, :, 2])
-        avg_gray = (avg_b + avg_g + avg_r) / 3
-        
-        if avg_b > 0:
-            result[:, :, 0] = result[:, :, 0] * (avg_gray / avg_b)
-        if avg_g > 0:
-            result[:, :, 1] = result[:, :, 1] * (avg_gray / avg_g)
-        if avg_r > 0:
-            result[:, :, 2] = result[:, :, 2] * (avg_gray / avg_r)
-        
+        """Natural white balance using LAB a/b correction"""
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        l, a, b = cv2.split(lab)
+
+        avg_a = np.mean(a)
+        avg_b = np.mean(b)
+
+        # Subtle neutralization
+        a -= (avg_a - 128) * 0.3
+        b -= (avg_b - 128) * 0.3
+
+        lab = cv2.merge([l, a, b])
+        return np.clip(cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR), 0, 255)
+    
+    def _smart_sharpen(self, img: np.ndarray, strength: float = 0.4) -> np.ndarray:
+        """Edge-aware sharpening for HD clarity"""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Edge mask
+        edges = cv2.Canny(gray, 60, 120)
+        edges = cv2.GaussianBlur(edges, (5, 5), 0)
+        edge_mask = edges / 255.0
+
+        blurred = cv2.GaussianBlur(img, (0, 0), 1.0)
+        sharpened = cv2.addWeighted(img, 1 + strength, blurred, -strength, 0)
+
+        # Apply sharpening only on edges
+        result = img * (1 - edge_mask[..., None]) + sharpened * edge_mask[..., None]
+
         return np.clip(result, 0, 255).astype(np.uint8)
     
-    def _smart_sharpen(self, img: np.ndarray, strength: float = None) -> np.ndarray:
-        """Smart sharpening using unsharp mask"""
-        strength = strength or self.params.sharpen_strength
-        blurred = cv2.GaussianBlur(img, (0, 0), self.params.sharpen_radius)
-        sharpened = cv2.addWeighted(img, 1 + strength, blurred, -strength, 0)
-        return np.clip(sharpened, 0, 255).astype(np.uint8)
-    
-    def _smart_denoise(self, img: np.ndarray, strength: float = None) -> np.ndarray:
-        """Bilateral filter denoising"""
-        strength = int(strength or self.params.denoise_strength)
-        return cv2.bilateralFilter(img, d=9, sigmaColor=strength * 2, sigmaSpace=strength)
+    def _smart_denoise(self, img: np.ndarray, strength: int = 6) -> np.ndarray:
+        """Very light denoise on luminance channel only"""
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        l = cv2.fastNlMeansDenoising(
+            l,
+            h=strength,
+            templateWindowSize=7,
+            searchWindowSize=21
+        )
+
+        lab = cv2.merge([l, a, b])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     
     def _apply_clahe(self, img: np.ndarray) -> np.ndarray:
         """Apply CLAHE contrast enhancement"""
@@ -930,35 +1017,111 @@ class ImageEnhancer:
         img: np.ndarray,
         background_color: Tuple[int, int, int] = (255, 255, 255)
     ) -> Tuple[np.ndarray, bool]:
-        """Remove background using GrabCut"""
+        """Remove background using advanced rembg + industrial product enhancement.
+
+        Returns (bgr_image, alpha_mask) where alpha_mask is a float32 array in [0,1]
+        or None if removal failed. This allows later operations to apply only on
+        foreground pixels and preserve transparent/background areas.
+        """
         try:
-            h, w = img.shape[:2]
-            mask = np.zeros((h, w), np.uint8)
-            margin = int(min(h, w) * 0.02)
-            rect = (margin, margin, w - 2*margin, h - 2*margin)
+            # Helper function to ensure odd kernel sizes for OpenCV
+            def _odd(k: int) -> int:
+                k = int(k)
+                if k <= 1:
+                    return 1
+                return k if k % 2 == 1 else k + 1
             
-            bgd_model = np.zeros((1, 65), np.float64)
-            fgd_model = np.zeros((1, 65), np.float64)
+            # Convert numpy to PIL for rembg
+            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).convert("RGB")
             
-            cv2.grabCut(img, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
-            mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+            # Step 1: Background removal using rembg
+            rgba = remove(pil_img).convert("RGBA")
             
-            kernel = np.ones((3, 3), np.uint8)
-            mask2 = cv2.morphologyEx(mask2, cv2.MORPH_CLOSE, kernel, iterations=2)
-            mask2 = cv2.morphologyEx(mask2, cv2.MORPH_OPEN, kernel, iterations=1)
+            # Step 2: Keep ORIGINAL alpha (do not blur)
+            alpha = np.array(rgba.split()[3]).astype(np.uint8)
             
-            mask_blur = cv2.GaussianBlur(mask2.astype(float), (5, 5), 0)
+            # Step 3: Create background with soft white
+            background = Image.new("RGBA", rgba.size, (*background_color, 255))
             
-            bg_color_bgr = (background_color[2], background_color[1], background_color[0])
-            background = np.full(img.shape, bg_color_bgr, dtype=np.uint8)
+            # Step 4: Floor-weighted grounding shadow
+            h, w = alpha.shape
+            gradient = np.linspace(0, 1, h).reshape(h, 1)
+            gradient = np.clip((gradient - 0.6) * 2.5, 0, 1)
             
-            mask_3ch = np.stack([mask_blur] * 3, axis=-1)
-            result = (img * mask_3ch + background * (1 - mask_3ch)).astype(np.uint8)
+            shadow_alpha = (alpha * gradient).astype(np.uint8)
+            k = _odd(40)  # shadow_blur = 40
+            shadow_alpha = cv2.GaussianBlur(shadow_alpha, (k, k), 0)
+            shadow_alpha = (shadow_alpha * 0.26).astype(np.uint8)  # shadow_opacity = 0.26
             
-            return result, True
+            shadow = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+            shadow.putalpha(Image.fromarray(shadow_alpha))
+            
+            # Step 5: Composite layers (preserve alpha separately)
+            composite = Image.alpha_composite(background, shadow)
+            composite = Image.alpha_composite(composite, rgba)
+            # composite_rgb is the RGB visual result against soft background
+            composite_rgb = composite.convert("RGB")
+            
+            # Step 6: Edge-safe color correction (LAB → L channel only)
+            img_np = np.array(composite)
+            lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(lab)
+            
+            clahe = cv2.createCLAHE(
+                clipLimit=1.6,
+                tileGridSize=(8, 8)
+            )
+            l = clahe.apply(l)
+            
+            lab = cv2.merge((l, a, b))
+            composite = Image.fromarray(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB))
+            
+            # Convert back to numpy BGR and build normalized alpha mask
+            result = cv2.cvtColor(np.array(composite_rgb), cv2.COLOR_RGB2BGR)
+            alpha_mask = (alpha.astype(np.float32) / 255.0)
+            # Smooth mask edges a bit to avoid harsh transitions
+            try:
+                mask_blur = cv2.GaussianBlur((alpha_mask * 255).astype(np.uint8), (5, 5), 0)
+                alpha_mask = (mask_blur.astype(np.float32) / 255.0)
+            except Exception:
+                pass
+
+            logger.info("✅ Background removed using rembg + industrial enhancement")
+            return result, alpha_mask
+            
         except Exception as e:
-            logger.warning(f"GrabCut failed: {e}")
-            return img, False
+            logger.warning(f"Advanced background removal failed, falling back to GrabCut: {e}")
+            try:
+                # Fallback to GrabCut if rembg fails
+                h, w = img.shape[:2]
+                mask = np.zeros((h, w), np.uint8)
+                margin = int(min(h, w) * 0.02)
+                rect = (margin, margin, w - 2*margin, h - 2*margin)
+                
+                bgd_model = np.zeros((1, 65), np.float64)
+                fgd_model = np.zeros((1, 65), np.float64)
+                
+                cv2.grabCut(img, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+                mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+                
+                kernel = np.ones((3, 3), np.uint8)
+                mask2 = cv2.morphologyEx(mask2, cv2.MORPH_CLOSE, kernel, iterations=2)
+                mask2 = cv2.morphologyEx(mask2, cv2.MORPH_OPEN, kernel, iterations=1)
+                
+                mask_blur = cv2.GaussianBlur(mask2.astype(float), (5, 5), 0)
+                alpha_mask = np.clip(mask_blur, 0.0, 1.0).astype(np.float32)
+                
+                bg_color_bgr = (background_color[2], background_color[1], background_color[0])
+                background = np.full(img.shape, bg_color_bgr, dtype=np.uint8)
+                
+                mask_3ch = np.stack([alpha_mask] * 3, axis=-1)
+                result = (img * mask_3ch + background * (1 - mask_3ch)).astype(np.uint8)
+                
+                logger.info("⚠️  Using fallback GrabCut background removal")
+                return result, alpha_mask
+            except Exception as e2:
+                logger.warning(f"GrabCut fallback also failed: {e2}")
+                return img, None
     
     def detect_background_complexity(self, img: np.ndarray) -> float:
         """Detect background complexity (0-1 scale)"""
@@ -986,11 +1149,14 @@ class ImageEnhancer:
         
         return min(1.0, complexity * 3)
     
-    def standardize_image(self, img: np.ndarray, config: Optional[StandardizationConfig] = None) -> np.ndarray:
-        """Standardize image dimensions"""
+    def standardize_image(self, img: np.ndarray, config: Optional[StandardizationConfig] = None, mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Standardize image dimensions. If `mask` is provided (2D float mask 0..1),
+        the mask will be resized and returned aligned with the standardized image.
+        Returns (canvas_image, canvas_mask_or_None).
+        """
         config = config or StandardizationConfig()
         h, w = img.shape[:2]
-        
+
         if config.target_width and config.target_height:
             target_w, target_h = config.target_width, config.target_height
         else:
@@ -1004,25 +1170,37 @@ class ImageEnhancer:
                 target_h = int(h * scale)
             else:
                 target_w, target_h = w, h
-        
+
         padding = int(min(target_w, target_h) * config.padding_percent / 100)
         content_w = target_w - 2 * padding
         content_h = target_h - 2 * padding
-        
+
         scale = min(content_w / w, content_h / h)
         new_w = int(w * scale)
         new_h = int(h * scale)
-        
+
         resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-        
+        resized_mask = None
+        if mask is not None:
+            try:
+                resized_mask = cv2.resize(mask.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                resized_mask = np.clip(resized_mask, 0.0, 1.0)
+            except Exception:
+                resized_mask = None
+
         bg_color_bgr = (config.background_color[2], config.background_color[1], config.background_color[0])
         canvas = np.full((target_h, target_w, 3), bg_color_bgr, dtype=np.uint8)
-        
+
         x_offset = (target_w - new_w) // 2
         y_offset = (target_h - new_h) // 2
         canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
-        
-        return canvas
+
+        canvas_mask = None
+        if resized_mask is not None:
+            canvas_mask = np.zeros((target_h, target_w), dtype=np.float32)
+            canvas_mask[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized_mask
+
+        return canvas, canvas_mask
     
     def _optimize_output(self, img: Image.Image, format: str, target_size_kb: int) -> bytes:
         """Optimize output file size"""
