@@ -526,6 +526,9 @@ class ImageEnhancer:
                 # update bg_mask to the transformed mask so later ops continue to use it
                 if transformed_mask is not None:
                     bg_mask = transformed_mask
+                # If AI was used (especially upscaling), preserve the high resolution
+                # Only standardize aspect ratio/padding, but don't downscale
+                enhanced = self.standardize_image(enhanced, config, maintain_resolution=result.ai_used)
                 enhancements.append("standardization")
                 logger.info(f"   ✅ Standardization Complete | Time: {int((time.time() - step_start) * 1000)}ms")
             
@@ -775,6 +778,9 @@ class ImageEnhancer:
                         name="upscale", method="ai", success=True,
                         latency_ms=result.latency_ms, cost_usd=result.estimated_cost
                     ))
+                    
+                    # Skip subsequent local enhancements (Sharpen, Contrast) as AI result is already polished
+                    return img, enhancements, steps
                 else:
                     img = self._apply_masked(img, mask, self._upscale_lanczos, self.params.upscale_factor)
                     enhancements.append("local_upscale_fallback")
@@ -1149,11 +1155,13 @@ class ImageEnhancer:
         
         return min(1.0, complexity * 3)
     
-    def standardize_image(self, img: np.ndarray, config: Optional[StandardizationConfig] = None, mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """Standardize image dimensions. If `mask` is provided (2D float mask 0..1),
-        the mask will be resized and returned aligned with the standardized image.
-        Returns (canvas_image, canvas_mask_or_None).
-        """
+    def standardize_image(
+        self, 
+        img: np.ndarray, 
+        config: Optional[StandardizationConfig] = None,
+        maintain_resolution: bool = False
+    ) -> np.ndarray:
+        """Standardize image dimensions"""
         config = config or StandardizationConfig()
         h, w = img.shape[:2]
 
@@ -1164,10 +1172,19 @@ class ImageEnhancer:
                 scale = config.min_dimension / min(w, h)
                 target_w = int(w * scale)
                 target_h = int(h * scale)
-            elif max(w, h) > config.max_dimension:
+                target_w = int(w * scale)
+                target_h = int(h * scale)
+            elif max(w, h) > config.max_dimension and not maintain_resolution:
                 scale = config.max_dimension / max(w, h)
                 target_w = int(w * scale)
                 target_h = int(h * scale)
+            elif maintain_resolution and max(w, h) > config.max_dimension:
+                 # If maintaining resolution, keep dimensions but ensuring padding logic works
+                 # We will set target to current dims (or slightly larger for padding)
+                 # Actually, standardization usually implies fixed box. 
+                 # If maintain_resolution is True, we define the "box" as the current image size 
+                 # plus padding, essentially ignoring max_dimension cap.
+                 target_w, target_h = w, h
             else:
                 target_w, target_h = w, h
 

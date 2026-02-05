@@ -31,6 +31,15 @@ from src.database import init_db, get_db, ImageRepository, ImageRecord
 from src.enhancer import ImageEnhancer
 from src.quality import QualityAssessor
 
+from src.s3_service import S3Service
+from src.logging_config import setup_logging
+import logging
+import uuid
+
+# Initialize logging for dashboard
+setup_logging(level="INFO")
+logger = logging.getLogger(__name__)
+
 # Page config
 st.set_page_config(
     page_title="Image Enhancement Pipeline",
@@ -39,11 +48,25 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize
+from src.s3_service import S3Service
+
+# Enhanced Image Quality Assessor
+from src.quality import QualityAssessor
+
+# --- CONFIGURATION ---
 config = get_config()
+
+# Initialize Services
 init_db()
 enhancer = ImageEnhancer()
 assessor = QualityAssessor()
+s3_service = S3Service(
+    bucket=config.storage.s3_bucket,
+    region=config.storage.s3_region,
+    endpoint_url=config.storage.s3_endpoint if config.storage.s3_endpoint else None,
+    access_key=config.storage.s3_access_key,
+    secret_key=config.storage.s3_secret_key
+)
 
 # Initialize session state for task approvals
 if "show_reject_reasons" not in st.session_state:
@@ -272,13 +295,13 @@ def display_comparison(original_bytes: bytes, enhanced_bytes: bytes, metrics: di
     
     with col1:
         st.subheader("📷 Original")
-        st.image(original_bytes, use_container_width=True)
+        st.image(original_bytes, use_column_width=True)
         st.caption(f"Size: {len(original_bytes)/1024:.1f} KB | "
                   f"Blur Score: {metrics.get('original_blur', 'N/A'):.1f}")
     
     with col2:
         st.subheader("✨ Enhanced")
-        st.image(enhanced_bytes, use_container_width=True)
+        st.image(enhanced_bytes, use_column_width=True)
         st.caption(f"Size: {len(enhanced_bytes)/1024:.1f} KB | "
                   f"Blur Score: {metrics.get('enhanced_blur', 'N/A'):.1f}")
 
@@ -551,9 +574,27 @@ def render_single_enhancement():
                                 if result_data.get('success'):
                                     # Fetch enhanced image from URL
                                     enhanced_url = result_data.get('enhanced_url')
+                                    # logger.info(f"Downloading enhanced image from: {enhanced_url}")
                                     enhanced_response = requests.get(enhanced_url, timeout=30)
+                                    
+                                    if enhanced_response.status_code != 200:
+                                        st.error(f"Failed to download enhanced image from S3. Status: {enhanced_response.status_code}")
+                                        logger.error(f"S3 Download Failed. Status: {enhanced_response.status_code}, Content: {enhanced_response.text[:200]}")
+                                        raise Exception(f"S3 Download Failed: {enhanced_response.status_code}")
+                                        
                                     enhanced_bytes = enhanced_response.content
-                                    enhanced_quality = assessor.quick_assess(enhanced_bytes)
+                                    
+                                    # Verify it's an image
+                                    if not enhanced_bytes or len(enhanced_bytes) < 100:
+                                         st.error("Downloaded file is too small to be an image")
+                                         raise Exception("Downloaded file too small")
+
+                                    try:
+                                        enhanced_quality = assessor.quick_assess(enhanced_bytes)
+                                    except Exception as e:
+                                        logger.error(f"Failed to assess image. Content start: {enhanced_bytes[:500]}")
+                                        st.error(f"Cannot identify image file. Content preview: {enhanced_bytes[:200]}")
+                                        raise e
                                     
                                     # Display comparison
                                     display_comparison(
@@ -1380,6 +1421,47 @@ def main():
     </div>
     """, unsafe_allow_html=True)
     
+    # Sidebar
+    with st.sidebar:
+        st.markdown("### 🎛️ Control Panel")
+        st.markdown("---")
+        
+        # Status indicator
+        st.markdown("#### 📡 System Status")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("🟢 **API**")
+        with col2:
+            # Check S3 status
+            s3_status = "🟢" if s3_service.is_available() else "🔴"
+            st.markdown(f"{s3_status} **S3**")
+        
+        st.markdown("---")
+        
+        st.markdown("#### 🔗 API Endpoints")
+        st.code("POST /api/v1/enhance/url", language=None)
+        st.code("POST /api/v1/enhance/upload", language=None)
+        
+        st.markdown("---")
+        
+        st.markdown("#### 📚 Documentation")
+        st.markdown("• [📄 API Docs](http://localhost:8000/docs)")
+        st.markdown("• [❤️ Health Check](http://localhost:8000/health)")
+        st.markdown("• [📊 Stats](http://localhost:8000/api/v1/stats)")
+        
+        st.markdown("---")
+        
+        if st.button("🔄 Refresh Dashboard", use_container_width=True):
+            st.rerun()
+        
+        st.markdown("---")
+        st.markdown(
+            "<div style='text-align: center; color: #6c757d; font-size: 0.8rem;'>"
+            "v2.0.0 • Built with ❤️"
+            "</div>",
+            unsafe_allow_html=True
+        )
+    
     # Main content - KPI cards
     render_kpi_cards()
     
@@ -1499,4 +1581,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

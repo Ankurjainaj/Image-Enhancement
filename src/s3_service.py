@@ -9,9 +9,10 @@ from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
 from urllib.parse import urlparse
-
+from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
+load_dotenv()
 
 class S3Service:
     """Service for managing images in AWS S3"""
@@ -246,3 +247,7 @@ class S3Service:
             error_msg = f"Failed to get object metadata: {str(e)}"
             logger.error(error_msg)
             raise Exception(error_msg)
+    
+    def is_available(self) -> bool:
+        """Check if S3 storage is available"""
+        return self.s3_client is not None
