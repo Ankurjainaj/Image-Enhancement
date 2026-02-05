@@ -906,7 +906,7 @@ def render_my_tasks():
                             img = Image.open(io.BytesIO(img_bytes))
                             img_display = img.copy()
                             img_display.thumbnail((300, 300), Image.Resampling.LANCZOS)
-                            st.image(img_display, use_container_width=True)
+                            st.image(img_display, use_column_width=True)
                         else:
                             st.warning("❌ Cannot load")
                     except Exception as e:
@@ -925,7 +925,7 @@ def render_my_tasks():
                             img = Image.open(io.BytesIO(img_bytes))
                             img_display = img.copy()
                             img_display.thumbnail((300, 300), Image.Resampling.LANCZOS)
-                            st.image(img_display, use_container_width=True)
+                            st.image(img_display, use_column_width=True)
                         else:
                             st.warning("❌ Cannot load")
                     except Exception as e:
@@ -1143,7 +1143,7 @@ def render_approved_tasks():
                                 img_bytes = get_image_from_url(original_url, timeout=10)
                                 if img_bytes:
                                     img = Image.open(io.BytesIO(img_bytes))
-                                    st.image(img, use_container_width=True)
+                                    st.image(img, use_column_width=True)
                                     st.caption(f"🔗 {original_url}")
                                 else:
                                     st.warning("❌ Cannot load")
@@ -1157,7 +1157,7 @@ def render_approved_tasks():
                                 img_bytes = get_image_from_url(enhanced_url, timeout=10)
                                 if img_bytes:
                                     img = Image.open(io.BytesIO(img_bytes))
-                                    st.image(img, use_container_width=True)
+                                    st.image(img, use_column_width=True)
                                     st.caption(f"🔗 {enhanced_url}")
                                 else:
                                     st.warning("❌ Cannot load")
@@ -1422,45 +1422,45 @@ def main():
     """, unsafe_allow_html=True)
     
     # Sidebar
-    with st.sidebar:
-        st.markdown("### 🎛️ Control Panel")
-        st.markdown("---")
+    # with st.sidebar:
+    #     st.markdown("### 🎛️ Control Panel")
+    #     st.markdown("---")
         
-        # Status indicator
-        st.markdown("#### 📡 System Status")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("🟢 **API**")
-        with col2:
-            # Check S3 status
-            s3_status = "🟢" if s3_service.is_available() else "🔴"
-            st.markdown(f"{s3_status} **S3**")
+    #     # Status indicator
+    #     st.markdown("#### 📡 System Status")
+    #     col1, col2 = st.columns(2)
+    #     with col1:
+    #         st.markdown("🟢 **API**")
+    #     with col2:
+    #         # Check S3 status
+    #         s3_status = "🟢" if s3_service.is_available() else "🔴"
+    #         st.markdown(f"{s3_status} **S3**")
         
-        st.markdown("---")
+    #     st.markdown("---")
         
-        st.markdown("#### 🔗 API Endpoints")
-        st.code("POST /api/v1/enhance/url", language=None)
-        st.code("POST /api/v1/enhance/upload", language=None)
+    #     st.markdown("#### 🔗 API Endpoints")
+    #     st.code("POST /api/v1/enhance/url", language=None)
+    #     st.code("POST /api/v1/enhance/upload", language=None)
         
-        st.markdown("---")
+    #     st.markdown("---")
         
-        st.markdown("#### 📚 Documentation")
-        st.markdown("• [📄 API Docs](http://localhost:8000/docs)")
-        st.markdown("• [❤️ Health Check](http://localhost:8000/health)")
-        st.markdown("• [📊 Stats](http://localhost:8000/api/v1/stats)")
+    #     st.markdown("#### 📚 Documentation")
+    #     st.markdown("• [📄 API Docs](http://localhost:8000/docs)")
+    #     st.markdown("• [❤️ Health Check](http://localhost:8000/health)")
+    #     st.markdown("• [📊 Stats](http://localhost:8000/api/v1/stats)")
         
-        st.markdown("---")
+    #     st.markdown("---")
         
-        if st.button("🔄 Refresh Dashboard", use_container_width=True):
-            st.rerun()
+    #     if st.button("🔄 Refresh Dashboard", use_container_width=True):
+    #         st.rerun()
         
-        st.markdown("---")
-        st.markdown(
-            "<div style='text-align: center; color: #6c757d; font-size: 0.8rem;'>"
-            "v2.0.0 • Built with ❤️"
-            "</div>",
-            unsafe_allow_html=True
-        )
+    #     st.markdown("---")
+    #     st.markdown(
+    #         "<div style='text-align: center; color: #6c757d; font-size: 0.8rem;'>"
+    #         "v2.0.0 • Built with ❤️"
+    #         "</div>",
+    #         unsafe_allow_html=True
+    #     )
     
     # Main content - KPI cards
     render_kpi_cards()

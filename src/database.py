@@ -11,6 +11,7 @@ from sqlalchemy import (
     create_engine, Column, String, Integer, Float, Boolean,
     DateTime, Text, JSON, ForeignKey, Index, BigInteger, SmallInteger
 )
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from sqlalchemy.pool import QueuePool
@@ -82,13 +83,13 @@ class SKU(Base):
     is_active = Column(Boolean, default=True)
     
     # Image counts
+    from sqlalchemy import inspect, text
     total_images = Column(Integer, default=0)
     enhanced_images = Column(Integer, default=0)
     pending_images = Column(Integer, default=0)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
     # Relationships
     images = relationship("ProductImage", back_populates="sku", cascade="all, delete-orphan")
     
@@ -530,6 +531,12 @@ def get_engine():
             pool_recycle=config.database.pool_recycle,
             pool_pre_ping=True,
         )
+        # If auto-migrate flag enabled, attempt to create/update schema
+        try:
+            if getattr(config.database, "auto_migrate", False):
+                _sync_schema(_engine)
+        except Exception as e:
+            print("Auto-migrate failed:", e)
     return _engine
 
 
@@ -555,6 +562,77 @@ def init_db():
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     print("Database tables created successfully")
+
+
+def _add_missing_columns(engine):
+    """Add any missing columns to existing tables (development convenience).
+
+    This is a best-effort helper: it will only add missing non-primary columns
+    using simple type mappings for common column types. It is intended for
+    development only and not a replacement for proper migrations in production.
+    """
+    inspector = inspect(engine)
+    with engine.connect() as conn:
+        for table_name, table in Base.metadata.tables.items():
+            try:
+                existing = [c["name"] for c in inspector.get_columns(table_name)]
+            except Exception:
+                # table may not exist yet
+                continue
+
+            for col in table.columns:
+                if col.name in existing:
+                    continue
+                if col.primary_key:
+                    # don't attempt to add primary key columns automatically
+                    continue
+
+                coltype = col.type
+                sql_type = None
+                # Basic type mapping for MySQL
+                if isinstance(coltype, String):
+                    length = getattr(coltype, "length", None)
+                    sql_type = f"VARCHAR({length})" if length else "TEXT"
+                elif isinstance(coltype, Integer):
+                    sql_type = "INTEGER"
+                elif isinstance(coltype, BigInteger):
+                    sql_type = "BIGINT"
+                elif isinstance(coltype, SmallInteger):
+                    sql_type = "SMALLINT"
+                elif isinstance(coltype, Float):
+                    sql_type = "FLOAT"
+                elif isinstance(coltype, Boolean):
+                    sql_type = "BOOLEAN"
+                elif isinstance(coltype, DateTime):
+                    sql_type = "DATETIME"
+                elif isinstance(coltype, Text):
+                    sql_type = "TEXT"
+                else:
+                    # Fallback: use the compiled type if possible
+                    try:
+                        sql_type = str(coltype)
+                    except Exception:
+                        sql_type = "TEXT"
+
+                nullable = "" if col.nullable else "NOT NULL"
+                alter = f"ALTER TABLE `{table_name}` ADD COLUMN `{col.name}` {sql_type} {nullable};"
+                try:
+                    conn.execute(text(alter))
+                    print(f"Added column {col.name} to {table_name}")
+                except Exception as e:
+                    print(f"Failed to add column {col.name} to {table_name}: {e}")
+
+
+def _sync_schema(engine):
+    """Run create_all and add missing columns when enabled.
+
+    Intended for development use only. For production use proper migrations.
+    """
+    try:
+        Base.metadata.create_all(bind=engine)
+        _add_missing_columns(engine)
+    except Exception as e:
+        print("Schema sync failed:", e)
 
 
 def get_db_session():

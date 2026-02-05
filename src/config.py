@@ -210,6 +210,8 @@ class MySQLConfig:
     max_overflow: int = 20
     pool_recycle: int = 3600
     echo: bool = False
+    # Auto-migrate/create tables and missing columns when true (development convenience)
+    auto_migrate: bool = field(default_factory=lambda: os.getenv("DB_AUTO_MIGRATE", "false").lower() == "true")
     
     @property
     def url(self) -> str:
